@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>metis · Monitor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2376b900'/%3E%3Cpath d='M7 23V9l9 9 9-9v14' stroke='%23000' stroke-width='3.2' fill='none' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="logo" aria-hidden="true">M</div>
+    <div>
+      <h1 id="hostname">metis</h1>
+      <div class="sub" id="hostinfo">–</div>
+    </div>
+  </div>
+  <div class="top-meta">
+    <div class="meta-item"><span class="lbl">Uptime</span><span id="uptime" class="mono">–</span></div>
+    <div class="meta-item"><span class="lbl">IP</span><span id="ip" class="mono">–</span></div>
+    <a class="health" id="health" href="#problems"><span class="dot"></span><span id="health-txt">prüfe…</span></a>
+    <div class="live" id="live"><span class="dot"></span><span id="live-txt">verbinde…</span></div>
+  </div>
+</header>
+
+<nav class="tabs" id="nav">
+  <a href="#overview" class="active">Übersicht</a>
+  <a href="#energy">Energie</a>
+  <a href="#ai">KI</a>
+  <a href="#system">System</a>
+  <a href="#mqtt">MQTT</a>
+</nav>
+
+<main>
+  <!-- KPI tiles -->
+  <section id="overview" class="tiles">
+    <div class="tile" data-k="cpu"><div class="t-head"><span>CPU</span><span class="t-sub" id="t-cpu-sub"></span></div><div class="t-val"><span id="t-cpu">–</span><small>%</small></div><div class="meter"><i id="m-cpu"></i></div></div>
+    <div class="tile" data-k="gpu"><div class="t-head"><span>GPU</span><span class="t-sub" id="t-gpu-sub"></span></div><div class="t-val"><span id="t-gpu">–</span><small>%</small></div><div class="meter"><i id="m-gpu"></i></div></div>
+    <div class="tile" data-k="mem"><div class="t-head"><span>Unified Memory</span><span class="t-sub" id="t-mem-sub"></span></div><div class="t-val"><span id="t-mem">–</span><small>GiB</small></div><div class="meter"><i id="m-mem"></i></div></div>
+    <div class="tile" data-k="temp"><div class="t-head"><span>Temperatur</span><span class="t-sub">CPU · GPU · NVMe</span></div><div class="t-val t-multi"><span id="t-tcpu">–</span><span class="sep">/</span><span id="t-tgpu">–</span><span class="sep">/</span><span id="t-tnvme">–</span><small>°C</small></div><div class="meter"><i id="m-temp"></i></div></div>
+    <div class="tile" data-k="power"><div class="t-head"><span id="t-pwr-label">Leistung</span><span class="t-sub" id="t-pwr-sub"></span></div><div class="t-val"><span id="t-pwr">–</span><small>W</small></div><div class="meter"><i id="m-pwr"></i></div></div>
+    <div class="tile" data-k="energy"><div class="t-head"><span>Energie heute</span><span class="t-sub" id="t-en-sub"></span></div><div class="t-val"><span id="t-en">–</span><small>kWh</small></div><div class="t-foot" id="t-en-foot"></div></div>
+    <div class="tile" data-k="ai"><div class="t-head"><span>Ollama</span><span class="t-sub" id="t-ai-sub"></span></div><div class="t-val t-text" id="t-ai">–</div><div class="t-foot" id="t-ai-foot"></div></div>
+    <a class="tile tile-link" data-k="updates" href="#updates"><div class="t-head"><span>Updates</span><span class="t-sub" id="t-up-sub"></span></div><div class="t-val"><span id="t-up">–</span><small id="t-up-unit">ausstehend</small></div><div class="t-foot" id="t-up-foot"></div></a>
+  </section>
+
+  <section class="problems" id="problems" hidden></section>
+
+  <section class="panel charts-panel">
+    <div class="panel-head">
+      <h2>Verlauf</h2>
+      <div class="seg" id="range">
+        <button data-r="1h" class="on">1 h</button><button data-r="6h">6 h</button><button data-r="24h">24 h</button><button data-r="7d">7 T</button>
+      </div>
+    </div>
+    <div class="charts">
+      <figure class="chart" id="ch-util"></figure>
+      <figure class="chart" id="ch-temp"></figure>
+      <figure class="chart" id="ch-power"></figure>
+      <figure class="chart" id="ch-net"></figure>
+      <figure class="chart" id="ch-psi"></figure>
+      <figure class="chart" id="ch-ping"></figure>
+    </div>
+  </section>
+
+  <section class="panel energy-panel" id="energy">
+    <div class="panel-head">
+      <h2>Energie <span class="muted" id="en-plug"></span></h2>
+      <div class="actions"><span class="pill" id="en-status">–</span><button class="btn ghost" id="btn-power">Einstellungen</button></div>
+    </div>
+    <div id="en-body">
+      <div class="kv-row" id="en-kpis"></div>
+      <div class="en-hist-head">
+        <h3>Verlauf</h3>
+        <div class="seg" id="en-range">
+          <button data-r="1h">1 h</button><button data-r="6h">6 h</button><button data-r="24h" class="on">24 h</button><button data-r="7d">7 T</button>
+        </div>
+      </div>
+      <div class="kv-row kv-compact" id="en-hist-stats"></div>
+      <figure class="chart chart-energy" id="ch-energy"></figure>
+      <h3>Verbrauch pro Tag <span class="muted">(30 Tage)</span></h3>
+      <div class="bars bars-30" id="en-daily"></div>
+      <div class="note" id="en-note"></div>
+    </div>
+  </section>
+
+  <!-- AI -->
+  <h2 class="section-title" id="ai">KI</h2>
+  <div class="grid-2">
+    <section class="panel">
+      <div class="panel-head"><h2>Ollama</h2><span class="pill" id="ol-status">–</span></div>
+      <div class="kv-row" id="ol-kpis"></div>
+      <h3>Geladene Modelle</h3>
+      <div id="ol-loaded" class="list"></div>
+      <h3>Anfragen pro Stunde <span class="muted">(24 h)</span></h3>
+      <div class="bars" id="ol-hourly"></div>
+      <div class="split">
+        <div><h3>Clients <span class="muted">(24 h)</span></h3><div id="ol-clients" class="list compact"></div></div>
+        <div><h3>Endpunkte <span class="muted">(24 h)</span></h3><div id="ol-paths" class="list compact"></div></div>
+      </div>
+      <h3>Letzte Anfragen</h3>
+      <div class="table-wrap"><table class="tbl" id="ol-recent"></table></div>
+      <h3>Modell-Ladezeiten <span class="muted">(7 Tage)</span></h3>
+      <div id="ol-loads" class="list compact"></div>
+      <h3>Installierte Modelle</h3>
+      <div class="table-wrap"><table class="tbl" id="ol-installed"></table></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Open WebUI</h2><span class="pill" id="ow-status">–</span></div>
+      <div class="kv-row" id="ow-kpis"></div>
+      <h3>Antworten pro Stunde <span class="muted">(24 h)</span></h3>
+      <div class="bars" id="ow-hourly"></div>
+      <h3>Nutzung pro Modell</h3>
+      <div class="table-wrap"><table class="tbl" id="ow-models"></table></div>
+      <div id="ow-last" class="note"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Energie pro Antwort</h2><span class="muted mono" id="ae-base"></span></div>
+      <div class="kv-row" id="ae-kpis"></div>
+      <div class="table-wrap"><table class="tbl" id="ae-models"></table></div>
+      <div class="note" id="ae-note"></div>
+    </section>
+
+    <section class="panel" id="voice">
+      <div class="panel-head"><h2>Sprachdienste</h2><span class="muted">Wyoming · Home Assistant</span></div>
+      <div id="voice-body" class="voice"></div>
+      <div class="note">Gezählt werden TCP-Verbindungen von Clients zu den Containern. Whisper und Piper schreiben selbst keine Anfragen ins Log.</div>
+    </section>
+  </div>
+
+  <!-- System -->
+  <h2 class="section-title" id="system">System</h2>
+  <div class="grid-3">
+    <section class="panel" id="services">
+      <div class="panel-head"><h2>Dienste</h2><span class="pill" id="svc-status">–</span></div>
+      <div id="svc-list" class="list compact"></div>
+      <h3>systemd-Units</h3>
+      <div id="units" class="list compact"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>CPU-Kerne</h2><span class="muted mono" id="cpu-load"></span></div>
+      <div class="cores" id="cores"></div>
+      <div class="note" id="cpu-model"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>GPU</h2><span class="muted mono" id="gpu-pstate"></span></div>
+      <dl class="dl" id="gpu-info"></dl>
+      <h3>GPU-Prozesse</h3>
+      <div id="gpu-procs" class="list compact"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Speicher &amp; Netz</h2></div>
+      <dl class="dl" id="io-info"></dl>
+      <div id="disks"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Druck &amp; OOM</h2><span class="muted mono">PSI</span></div>
+      <div id="psi" class="psi"></div>
+      <h3>OOM-Kills <span class="muted">(7 Tage)</span></h3>
+      <div id="oom" class="list compact"></div>
+      <div class="note">PSI zeigt, wie viel Zeit Prozesse auf CPU, Speicher oder IO warten. „voll“ bedeutet, dass alle Prozesse gleichzeitig blockiert waren.</div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Temperaturen</h2></div>
+      <div id="temps" class="list compact"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>NVMe</h2><span class="pill" id="nvme-status">–</span></div>
+      <dl class="dl" id="nvme-info"></dl>
+      <div class="note" id="nvme-note"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Netzwerk-Qualität</h2><span class="muted mono" id="ping-ts"></span></div>
+      <div id="ping" class="list"></div>
+    </section>
+    <section class="panel" id="updates">
+      <div class="panel-head"><h2>System-Updates</h2><span class="pill" id="up-status">–</span></div>
+      <div id="up-reboot"></div>
+      <div id="up-list" class="list compact up-list"></div>
+      <div class="note" id="up-note"></div>
+    </section>
+    <section class="panel span-2">
+      <div class="panel-head"><h2>Journal-Fehler</h2><span class="muted mono" id="jr-count"></span></div>
+      <div class="split">
+        <div><h3 style="margin-top:0">Quellen <span class="muted">(24 h)</span></h3><div id="jr-sources" class="list compact"></div></div>
+        <div><h3 style="margin-top:0">Neueste</h3><div id="jr-recent" class="list compact jr-recent"></div></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>SSH</h2><span class="pill" id="ssh-status">–</span></div>
+      <div class="kv-row" id="ssh-kpis"></div>
+      <h3>Letzte Logins</h3>
+      <div id="ssh-logins" class="list compact"></div>
+      <h3>Fehlversuche nach Quelle <span class="muted">(7 Tage)</span></h3>
+      <div id="ssh-fails" class="list compact"></div>
+    </section>
+    <section class="panel span-3">
+      <div class="panel-head"><h2>Docker-Container</h2><span class="muted" id="ct-count"></span></div>
+      <div class="table-wrap"><table class="tbl" id="containers"></table></div>
+    </section>
+  </div>
+
+  <!-- MQTT -->
+  <h2 class="section-title" id="mqtt">MQTT</h2>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Broker</h2>
+      <div class="actions">
+        <button class="btn" id="btn-add">+ Broker hinzufügen</button>
+      </div>
+    </div>
+    <p class="note" id="mqtt-note"></p>
+    <div class="brokers" id="brokers"></div>
+    <details class="sensor-list">
+      <summary>Veröffentlichte Werte (<span id="sensor-count">0</span>)</summary>
+      <div class="table-wrap"><table class="tbl" id="sensors"></table></div>
+    </details>
+  </section>
+
+  <footer class="foot">metis-monitor <span id="ver"></span> · <a href="/api/metrics" target="_blank">/api/metrics</a> · <a href="/docs" target="_blank">API</a></footer>
+</main>
+
+<dialog id="dlg">
+  <form id="broker-form" method="dialog">
+    <h2 id="dlg-title">Broker</h2>
+    <input type="hidden" name="id">
+    <div class="form-grid">
+      <label class="span-2">Name<input name="name" placeholder="Home Assistant Wohnung"></label>
+      <label>Host / IP<input name="host" required placeholder="homeassistant.local"></label>
+      <label>Port<input name="port" type="number" min="1" max="65535" value="1883"></label>
+      <label>Benutzer<input name="username" autocomplete="off"></label>
+      <label>Passwort<input name="password" type="password" autocomplete="new-password" placeholder="unverändert"></label>
+      <label>Topic-Präfix<input name="base_topic" value="metis"></label>
+      <label>Intervall (s)<input name="interval" type="number" min="1" value="10"></label>
+      <label>Discovery-Präfix<input name="discovery_prefix" value="homeassistant"></label>
+      <div class="checks">
+        <label class="chk"><input type="checkbox" name="enabled" checked> aktiv</label>
+        <label class="chk"><input type="checkbox" name="discovery" checked> HA Discovery</label>
+        <label class="chk"><input type="checkbox" name="tls"> TLS</label>
+        <label class="chk"><input type="checkbox" name="tls_insecure"> Zertifikat nicht prüfen</label>
+      </div>
+      <label class="span-2 admin">Admin-Passwort<input name="admin" type="password" autocomplete="current-password" required></label>
+    </div>
+    <div class="dlg-msg" id="dlg-msg"></div>
+    <div class="dlg-actions">
+      <button type="button" class="btn ghost danger" id="dlg-delete">Löschen</button>
+      <span class="grow"></span>
+      <button type="button" class="btn ghost" id="dlg-test">Verbindung testen</button>
+      <button type="button" class="btn ghost" id="dlg-cancel">Abbrechen</button>
+      <button type="submit" class="btn primary" id="dlg-save">Speichern</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-power">
+  <form id="power-form" method="dialog">
+    <h2>Energiemessung (Shelly)</h2>
+    <p class="note">Shelly Gen2 oder neuer. Wird nur gelesen, der Ausgang wird nie geschaltet.</p>
+    <div class="form-grid">
+      <label>Host / IP<input name="host" placeholder="shellyplug.local"></label>
+      <label>Kanal<input name="channel" type="number" min="0" value="0"></label>
+      <label>Passwort (falls aktiv)<input name="password" type="password" autocomplete="new-password" placeholder="unverändert"></label>
+      <label>Strompreis €/kWh<input name="price_eur_kwh" inputmode="decimal" placeholder="z. B. 0,32"></label>
+      <label class="span-2 admin">Admin-Passwort<input name="admin" type="password" autocomplete="current-password" required></label>
+    </div>
+    <div class="dlg-msg" id="power-msg"></div>
+    <div class="dlg-actions">
+      <span class="grow"></span>
+      <button type="button" class="btn ghost" id="power-cancel">Abbrechen</button>
+      <button type="submit" class="btn primary">Speichern</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="tip" id="tip"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

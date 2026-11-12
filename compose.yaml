@@ -1,0 +1,28 @@
+services:
+  metis-monitor:
+    build: .
+    image: metis-monitor:latest
+    container_name: metis-monitor
+    network_mode: host          # host interfaces/IP + reach Ollama/Open WebUI on localhost
+    pid: host                   # GPU process names
+    restart: unless-stopped
+    devices:
+      - nvidia.com/gpu=all      # CDI: nvidia-smi inside the container
+    environment:
+      - TZ=Europe/Berlin
+      - PORT=8088
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - PUBLIC_URL=${PUBLIC_URL:-}   # optional, z. B. http://<host>:8088 (Link in Home Assistant)
+    volumes:
+      - ./data:/data
+      - /:/host:ro                                   # disk usage, os-release, hostname
+      - /var/run/docker.sock:/var/run/docker.sock:ro # container status (read only API calls)
+      - /var/log/journal:/var/log/journal:ro         # ollama request log
+      - /etc/machine-id:/etc/machine-id:ro
+      - /run:/hostrun:ro                             # reboot-required flag
+      - open-webui-data:/owui:ro                     # Open WebUI usage stats (read-only)
+
+volumes:
+  open-webui-data:
+    external: true
+    name: open-webui_open-webui
