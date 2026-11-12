@@ -25,6 +25,7 @@ DEFAULTS: dict = {
     "ollama_unit": "ollama.service",
     "openwebui_url": "http://127.0.0.1:8080",
     "openwebui_db": "/owui/webui.db",
+    "openwebui_container": "open-webui",
     "host_root": "/host",
     "disks": ["/"],
     "power": {"host": "", "channel": 0, "password": "", "price_eur_kwh": None},

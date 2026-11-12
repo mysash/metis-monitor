@@ -152,7 +152,12 @@ class BrokerPublisher:
                    if u.get("last_active") else None,
                    "models": {m["model"]: m["in_tokens"] + m["out_tokens"] for m in u.get("models", [])}}
                 for u in ow.get("per_user") or []]}), qos=0, retain=True)
-            self.sent += 4
+            oc = snapshot.get("owui_clients") or {}
+            self.client.publish(f"{self.base}/openwebui_clients", json.dumps({"clients": [
+                {k: c.get(k) for k in ("ip", "name", "web", "requests_1h", "requests_24h", "requests_7d", "avg_s",
+                                       "busy_s_24h", "errors_24h")} for c in oc.get("clients") or []]}),
+                qos=0, retain=True)
+            self.sent += 5
             self.last_publish = now
         except Exception as e:  # noqa: BLE001
             self.last_error = str(e)

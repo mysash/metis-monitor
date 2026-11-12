@@ -109,6 +109,9 @@ SENSORS = [
     S("ping_internet_loss", "Paketverlust Internet", "%", icon="mdi:lan-disconnect", precision=0),
     # AI energy / loads
     S("ollama_last_load_s", "Ollama letzte Modell-Ladezeit", "s", "duration", precision=1),
+    S("openwebui_api_requests_24h", "Open WebUI API-Anfragen (24h)", icon="mdi:api", precision=0,
+      attributes="openwebui_clients"),
+    S("openwebui_api_requests_1h", "Open WebUI API-Anfragen (1h)", icon="mdi:api", precision=0),
     S("ai_energy_per_reply_wh", "KI Mehrverbrauch pro Antwort", "Wh", None, "measurement", "mdi:lightning-bolt", precision=2),
 ]
 

@@ -115,8 +115,12 @@
       <h3>Nutzung pro Modell</h3>
       <div class="table-wrap"><table class="tbl" id="ow-models"></table></div>
       <div id="ow-last" class="note"></div>
-      <h3>Nutzung pro Nutzer</h3>
+      <h3>Nutzung pro Nutzer <span class="muted">(Chats im Web-UI)</span></h3>
       <div class="table-wrap"><table class="tbl ow-users" id="ow-users"></table></div>
+      <h3>Anfragen pro Client <span class="muted">(inkl. API, aus dem Zugriffslog)</span></h3>
+      <div class="table-wrap"><table class="tbl" id="ow-clients"></table></div>
+      <div class="note">API-Aufrufe (z. B. per API-Key) speichert Open WebUI nicht – daher keine Tokens, nur Anzahl und Dauer
+        (über die zugehörige Ollama-Anfrage). Zuordnung per IP; „Web-UI“ = Client nutzt auch die Browser-Oberfläche.</div>
     </section>
 
     <section class="panel">

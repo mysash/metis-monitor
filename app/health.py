@@ -377,6 +377,141 @@ class VoiceUsage:
 
 
 # --------------------------------------------------------------------------- NVMe SMART
+class OpenWebUIClients:
+    """Requests to Open WebUI per client IP, from the container's access log (Docker API, read-only).
+
+    API calls (/api/chat/completions with an API key) are not stored in webui.db, so this is the only
+    place they show up. Duration is taken from the matching Ollama request (Open WebUI -> Ollama on localhost).
+    """
+
+    ACCESS_RE = re.compile(r'- (\[?[0-9a-fA-F.:]+\]?):\d+ - "(\w+) (\S+) HTTP/[\d.]+" (\d{3})')
+    INFER = ("/api/chat/completions", "/api/v1/chat/completions", "/ollama/api/chat", "/ollama/api/generate",
+             "/ollama/v1/chat/completions", "/ollama/v1/completions", "/api/completions")
+    EMBED = ("/api/embeddings", "/api/v1/embeddings", "/ollama/api/embed", "/ollama/api/embeddings",
+             "/ollama/v1/embeddings")
+    WEB = ("/_app/", "/static/", "/ws/socket.io", "/api/v1/chats", "/api/v1/auths/")   # only browsers do this
+
+    def __init__(self, cfg, ollama_log) -> None:
+        self.container = cfg.get("openwebui_container", "open-webui")
+        self.ollama_log = ollama_log
+        self.http = httpx.Client(transport=httpx.HTTPTransport(uds=DOCKER_SOCK), base_url="http://docker")
+        self.events: deque = deque(maxlen=100_000)      # (ts, ip, kind, status, path)
+        self.web_ips: dict[str, float] = {}             # ip -> last browser-style request
+        self.since = time.time() - 7 * 86400
+        self.matched: dict[tuple, float] = {}           # (ts, ip) -> seconds
+
+    @staticmethod
+    def _frames(raw: bytes):
+        """Docker multiplexed log stream (non-TTY): 8-byte header per frame."""
+        i, n = 0, len(raw)
+        if n >= 8 and raw[0] in (0, 1, 2) and raw[1:4] == b"\0\0\0":
+            while i + 8 <= n:
+                size = int.from_bytes(raw[i + 4:i + 8], "big")
+                yield raw[i + 8:i + 8 + size].decode("utf-8", "replace")
+                i += 8 + size
+        else:                                            # TTY container: plain text
+            yield raw.decode("utf-8", "replace")
+
+    def _fetch(self) -> None:
+        now = time.time()
+        r = self.http.get(f"/containers/{self.container}/logs",
+                          params={"stdout": 1, "stderr": 1, "timestamps": 1, "since": int(self.since)}, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"Docker-Logs {self.container}: HTTP {r.status_code}")
+        last = self.since
+        seen = {(e[0], e[1], e[4]) for e in self.events if e[0] >= self.since - 2}
+        for chunk in self._frames(r.content):
+            for line in chunk.splitlines():
+                ts_s, _, msg = line.partition(" ")
+                m = self.ACCESS_RE.search(msg)
+                if not m:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_s[:26].rstrip("Z") + "+00:00").timestamp()
+                except ValueError:
+                    continue
+                ip, method, path, status = m.group(1).strip("[]"), m.group(2), m.group(3).split("?", 1)[0], int(m.group(4))
+                last = max(last, ts)
+                if path.startswith(self.WEB):
+                    self.web_ips[ip] = max(self.web_ips.get(ip, 0), ts)
+                if method != "POST":
+                    continue
+                kind = "chat" if path.startswith(self.INFER) else "embed" if path.startswith(self.EMBED) else None
+                if kind and (ts, ip, path) not in seen:
+                    self.events.append((ts, ip, kind, status, path))
+        self.since = max(self.since, last - 1)
+        while self.events and self.events[0][0] < now - 7 * 86400:
+            self.events.popleft()
+
+    def _match_durations(self) -> None:
+        """Pair Open WebUI requests with Ollama GIN events from localhost (start or end within 2 s)."""
+        with self.ollama_log.lock:
+            gin = [(e[0] - e[4], e[0], e[4]) for e in self.ollama_log.events
+                   if e[5] in ("127.0.0.1", "::1") and e[3] < 400]
+        gin.sort()
+        starts = [g[0] for g in gin]
+        used: set[int] = set()
+        for ts, ip, kind, status, _p in self.events:
+            if (ts, ip) in self.matched or status >= 400:
+                continue
+            best, bd = None, 2.0
+            lo = bisect.bisect_left(starts, ts - 3600)
+            for i in range(lo, bisect.bisect_right(starts, ts + 2)):
+                if i in used:
+                    continue
+                s, e, d = gin[i]
+                diff = min(abs(ts - s), abs(ts - e))
+                if diff < bd:
+                    best, bd = i, diff
+            if best is not None:
+                used.add(best)
+                self.matched[(ts, ip)] = gin[best][2]
+        cutoff = time.time() - 7 * 86400
+        self.matched = {k: v for k, v in self.matched.items() if k[0] >= cutoff}
+
+    def collect(self) -> dict:
+        self._fetch()
+        self._match_durations()
+        now = time.time()
+        per: dict[str, dict] = {}
+        hourly_api = [0] * 24
+        for ts, ip, kind, status, _p in self.events:
+            c = per.setdefault(ip, {"ip": ip, "requests_1h": 0, "requests_24h": 0, "requests_7d": 0, "embed_24h": 0,
+                                    "errors_24h": 0, "last": 0, "_d": []})
+            c["requests_7d"] += kind == "chat"
+            c["last"] = max(c["last"], ts)
+            if ts >= now - 86400:
+                if kind == "chat":
+                    c["requests_24h"] += 1
+                    d = self.matched.get((ts, ip))
+                    if d is not None:
+                        c["_d"].append(d)
+                else:
+                    c["embed_24h"] += 1
+                c["errors_24h"] += status >= 400
+            if ts >= now - 3600 and kind == "chat":
+                c["requests_1h"] += 1
+        clients = []
+        for c in per.values():
+            d = c.pop("_d")
+            c["avg_s"] = round(sum(d) / len(d), 2) if d else None
+            c["busy_s_24h"] = round(sum(d), 1) if d else 0
+            c["name"] = resolve(c["ip"])
+            c["web"] = c["ip"] in self.web_ips
+            clients.append(c)
+        clients.sort(key=lambda x: (x["requests_24h"], x["last"]), reverse=True)
+        for ts, ip, kind, _s, _p in self.events:
+            if kind == "chat" and ip not in self.web_ips and ts >= now - 86400:
+                idx = 23 - int((now - ts) // 3600)
+                if 0 <= idx < 24:
+                    hourly_api[idx] += 1
+        api = [c for c in clients if not c["web"]]
+        return {"available": True, "clients": clients, "hourly_api": hourly_api,
+                "api_requests_24h": sum(c["requests_24h"] for c in api),
+                "api_requests_1h": sum(c["requests_1h"] for c in api),
+                "requests_24h": sum(c["requests_24h"] for c in clients)}
+
+
 class NvmeCollector:
     """Identity from sysfs (unprivileged); SMART health from a smartctl JSON file written on the host."""
 
@@ -645,6 +780,8 @@ def flatten(s: dict) -> dict:
         "ssh_last_login": datetime.fromtimestamp(last_login["ts"], tz=timezone.utc).isoformat(timespec="seconds") if last_login else None,
         "ollama_last_load_s": r(loads[0]["seconds"]) if loads else None,
         "ai_energy_per_reply_wh": r(ea.get("wh_per_reply"), 3),
+        "openwebui_api_requests_24h": (s.get("owui_clients") or {}).get("api_requests_24h"),
+        "openwebui_api_requests_1h": (s.get("owui_clients") or {}).get("api_requests_1h"),
     }
     for key, v in svc.items():           # ollama/openwebui already exposed as *_up elsewhere
         if key not in ("ollama", "openwebui"):

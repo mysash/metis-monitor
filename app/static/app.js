@@ -240,6 +240,7 @@ function render(s) {
   renderUpdates(up);
   renderOllama(ol);
   renderOwui(ow);
+  renderOwClients(s.owui_clients || {});
   renderSystem(s);
   for (const fn of [renderHealth, renderServices, renderPsi, renderNvme, renderPing, renderJournal, renderSsh, renderVoice, renderAiEnergy]) {
     try { fn(s); } catch (e) { console.error(fn.name, e); }
@@ -339,6 +340,20 @@ function renderOllama(ol) {
       ${(x.capabilities || []).filter((c) => c !== "completion").map((c) => `<span class="tag">${esc(c)}</span>`).join(" ")}</td>
       <td class="sm">${esc(x.parameter_size || "")}</td><td class="sm mono">${esc(x.quantization || "")}</td><td class="num sm">${fmt.n(x.context_length)}</td><td class="num">${fmt.bytes(x.size)}</td></tr>`).join("") +
     `<tr><td class="sm">${(ol.installed || []).length} Modelle</td><td></td><td></td><td></td><td class="num sm">${fmt.bytes(ol.installed_size)}</td></tr>`;
+}
+
+function renderOwClients(oc) {
+  const el = $("#ow-clients");
+  if (!oc.available) { el.innerHTML = `<tr><td class="empty">${esc(oc.error || "wird gelesen…")}</td></tr>`; return; }
+  const cl = (oc.clients || []).filter((c) => c.requests_7d || c.embed_24h);
+  el.innerHTML = cl.length
+    ? `<tr><th>Client</th><th class="num" title="Chat-Anfragen letzte Stunde">1 h</th><th class="num" title="Chat-Anfragen 24 h">24 h</th><th class="num" title="Chat-Anfragen 7 Tage">7 T</th><th class="num" title="Ø Dauer (24 h)">Ø Dauer</th><th class="num" title="Summe Rechenzeit 24 h">Σ 24 h</th><th class="num">zuletzt</th></tr>` +
+      cl.map((c) => `<tr><td><span class="mono">${esc(c.name ? c.name.split(".")[0] : c.ip)}</span> <span class="pill sm-pill ${c.web ? "" : "ok"}">${c.web ? "Web-UI" : "API"}</span>
+          ${c.name ? `<div class="u-sub mono">${esc(c.ip)}</div>` : ""}${c.embed_24h ? `<div class="u-sub">+ ${fmt.n(c.embed_24h)} Embeddings</div>` : ""}${c.errors_24h ? `<div class="u-sub bad-t">${fmt.n(c.errors_24h)} Fehler</div>` : ""}</td>
+        <td class="num">${fmt.n(c.requests_1h)}</td><td class="num">${fmt.n(c.requests_24h)}</td><td class="num">${fmt.n(c.requests_7d)}</td>
+        <td class="num">${c.avg_s != null ? fmt.dur(c.avg_s) : "–"}</td><td class="num">${c.busy_s_24h ? fmt.dur(c.busy_s_24h) : "–"}</td>
+        <td class="num sm">${fmt.ago(c.last)}</td></tr>`).join("")
+    : `<tr><td class="empty">Keine Anfragen in den letzten 7 Tagen.</td></tr>`;
 }
 
 function renderOwui(ow) {

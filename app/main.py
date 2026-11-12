@@ -53,6 +53,8 @@ class Monitor:
         self.ping = H.Periodic("ping", 30, H.PingCollector(cfg).collect)
         self.energy_attr = H.Periodic("energy-attr", 300, H.EnergyAttribution(self.history, self.owui, self.ollama_log).collect,
                                       initial={"available": False, "reason": "wird berechnet…"})
+        self.owui_clients = H.Periodic("owui-clients", 30, H.OpenWebUIClients(cfg, self.ollama_log).collect,
+                                       initial={"available": False, "clients": []})
         self.mqtt = MqttManager(cfg)
         self.snapshot: dict = {}
         self.clients: set[WebSocket] = set()
@@ -75,7 +77,7 @@ class Monitor:
                 "ollama": ollama, "openwebui": owui, "docker": docker, "power": power,
                 "updates": self.updates, "services": services, "pressure": H.read_pressure(),
                 "journal": self.journal.data, "voice": self.voice.stats(), "nvme": self.nvme.data,
-                "ping": self.ping.data, "energy_attr": self.energy_attr.data}
+                "ping": self.ping.data, "energy_attr": self.energy_attr.data, "owui_clients": self.owui_clients.data}
         snap["metrics"] = C.flatten(snap)
         snap["problems"] = H.problems(snap)
         snap["metrics"].update(H.flatten(snap))
