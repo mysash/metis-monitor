@@ -15,7 +15,7 @@ inkl. Home-Assistant-Discovery.
 | GPU (Auslastung, Temp, Leistung, Takt, Prozesse) | `nvidia-smi` via CDI |
 | Ollama: Version, geladene/installierte Modelle | Ollama API `:11434` |
 | Ollama: Anfragen, Dauer, Clients, Endpunkte (24 h) | `journalctl -u ollama` (GIN-Log) |
-| Open WebUI: Nutzer, Chats, Antworten, Tokens, tok/s pro Modell | `webui.db` (read-only, Volume `open-webui_open-webui`) |
+| Open WebUI: Nutzer, Chats, Antworten, Tokens, tok/s pro Modell und pro Nutzer (inkl. Modelle je Nutzer) | `webui.db` (read-only, Volume `open-webui_open-webui`) |
 | Docker-Container | Docker-Socket (nur lesende Aufrufe) |
 | Leistung / Energie (Tag, Woche, Monat, Jahr, Kosten) | Shelly Gen2+ RPC (Host im Web-UI einstellbar), nur lesend; Tageswerte in `data/energy.db` |
 | Ausstehende apt-Updates, Sicherheitsupdates, Neustart nötig | `apt list --upgradable` gegen das Host-Root (read-only), `/run/reboot-required` |
@@ -57,6 +57,7 @@ Pro Broker:
 - `<präfix>/state` – alle Werte als JSON (retained)
 - `<präfix>/status` – `online` / `offline` (LWT)
 - `<präfix>/ollama` – geladene/installierte Modelle
+- `<präfix>/openwebui_users` – Nutzung pro Nutzer (Attribute von *Open WebUI Nutzer*)
 - `<präfix>/problems` – `{"problems": [...], "count": n}` (Attribute von *Problem*)
 - HA-Discovery unter `<discovery_prefix>/{sensor,binary_sensor}/metis/<key>/config` → Gerät **metis**
 

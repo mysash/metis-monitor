@@ -46,7 +46,7 @@ SENSORS = [
     S("ollama_last_request", "Ollama letzte Anfrage", None, "timestamp", None),
     # Open WebUI
     S("openwebui_up", "Open WebUI", None, "running", None, component="binary_sensor"),
-    S("openwebui_users", "Open WebUI Nutzer", icon="mdi:account-multiple", precision=0),
+    S("openwebui_users", "Open WebUI Nutzer", icon="mdi:account-multiple", precision=0, attributes="openwebui_users"),
     S("openwebui_active_users_24h", "Open WebUI aktive Nutzer (24h)", icon="mdi:account-clock", precision=0),
     S("openwebui_chats", "Open WebUI Chats", icon="mdi:forum", precision=0),
     S("openwebui_messages_24h", "Open WebUI Antworten (24h)", icon="mdi:message-text", precision=0),

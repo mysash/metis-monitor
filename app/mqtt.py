@@ -144,7 +144,15 @@ class BrokerPublisher:
             probs = snapshot.get("problems") or []
             self.client.publish(f"{self.base}/problems", json.dumps({"problems": probs, "count": len(probs)}),
                                 qos=0, retain=True)
-            self.sent += 3
+            ow = snapshot.get("openwebui", {})
+            self.client.publish(f"{self.base}/openwebui_users", json.dumps({"users": [
+                {k: u.get(k) for k in ("name", "role", "chats", "messages", "messages_24h", "tokens", "tokens_24h",
+                                       "tokens_7d", "in_tokens", "out_tokens")}
+                | {"last_active": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(u["last_active"]))
+                   if u.get("last_active") else None,
+                   "models": {m["model"]: m["in_tokens"] + m["out_tokens"] for m in u.get("models", [])}}
+                for u in ow.get("per_user") or []]}), qos=0, retain=True)
+            self.sent += 4
             self.last_publish = now
         except Exception as e:  # noqa: BLE001
             self.last_error = str(e)

@@ -534,10 +534,10 @@ class OpenWebUICollector:
             con = sqlite3.connect(f"file:{self.db}?immutable=1", uri=True, timeout=5)
         try:
             now = time.time()
-            users = con.execute("select last_active_at from user").fetchall()
-            chats = con.execute("select updated_at, archived from chat").fetchall()
+            users = con.execute("select id, name, role, last_active_at, created_at from user").fetchall()
+            chats = con.execute("select updated_at, archived, user_id from chat").fetchall()
             msgs = con.execute(
-                "select model_id, usage, created_at from chat_message where role='assistant'"
+                "select model_id, usage, created_at, user_id from chat_message where role='assistant'"
             ).fetchall()
         finally:
             con.close()
@@ -546,7 +546,18 @@ class OpenWebUICollector:
         last = None
         hourly = [0] * 24
         recent = []
-        for model, usage, created in msgs:
+        per_user: dict[str, dict] = {}
+        for uid, name, role, la, cr in users:
+            per_user[uid] = {"name": name or "?", "role": role, "last_active": _ts_norm(la), "created": _ts_norm(cr),
+                             "chats": 0, "chats_24h": 0, "messages": 0, "messages_24h": 0, "messages_7d": 0,
+                             "in_tokens": 0, "out_tokens": 0, "tokens_24h": 0, "tokens_7d": 0, "last": 0, "_m": {}}
+        for up, _a, uid in chats:
+            pu = per_user.get(uid)
+            if pu:
+                pu["chats"] += 1
+                if _ts_norm(up) >= now - 86400:
+                    pu["chats_24h"] += 1
+        for model, usage, created, uid in msgs:
             ts = _ts_norm(created)
             try:
                 u = json.loads(usage) if usage else {}
@@ -576,25 +587,60 @@ class OpenWebUICollector:
                     hourly[idx] += 1
             if last is None or ts >= last[0]:
                 last = (ts, model, tps)
+            pu = per_user.get(uid)
+            if pu:
+                pu["messages"] += 1
+                pu["in_tokens"] += in_t
+                pu["out_tokens"] += out_t
+                pu["last"] = max(pu["last"], ts)
+                if ts >= now - 7 * 86400:
+                    pu["messages_7d"] += 1
+                    pu["tokens_7d"] += in_t + out_t
+                if ts >= now - 86400:
+                    pu["messages_24h"] += 1
+                    pu["tokens_24h"] += in_t + out_t
+                um = pu["_m"].setdefault(model or "?", {"model": model or "?", "messages": 0, "in_tokens": 0,
+                                                       "out_tokens": 0, "tokens_24h": 0, "_tps": [], "last": 0})
+                um["messages"] += 1
+                um["in_tokens"] += in_t
+                um["out_tokens"] += out_t
+                um["last"] = max(um["last"], ts)
+                if ts >= now - 86400:
+                    um["tokens_24h"] += in_t + out_t
+                if isinstance(tps, (int, float)) and tps > 0:
+                    um["_tps"].append(tps)
         models = []
         for pm in per_model.values():
             t = pm.pop("_tps")
             pm["avg_tps"] = round(sum(t) / len(t), 1) if t else None
             models.append(pm)
         models.sort(key=lambda x: x["messages"], reverse=True)
+        users_out = []
+        for pu in per_user.values():
+            ms = []
+            for um in pu.pop("_m").values():
+                t = um.pop("_tps")
+                um["avg_tps"] = round(sum(t) / len(t), 1) if t else None
+                ms.append(um)
+            ms.sort(key=lambda x: x["in_tokens"] + x["out_tokens"], reverse=True)
+            pu["models"] = ms
+            pu["tokens"] = pu["in_tokens"] + pu["out_tokens"]
+            users_out.append(pu)
+        users_out.sort(key=lambda x: (x["tokens"], x["last_active"]), reverse=True)
         self.recent = recent
         return {
             "db_available": True,
             "users": len(users),
-            "active_users_24h": sum(1 for (la,) in users if _ts_norm(la) >= now - 86400),
+            "active_users_24h": sum(1 for u in users if _ts_norm(u[3]) >= now - 86400),
             "chats": len(chats),
-            "chats_active_24h": sum(1 for (up, _a) in chats if _ts_norm(up) >= now - 86400),
+            "chats_active_24h": sum(1 for c in chats if _ts_norm(c[0]) >= now - 86400),
             "messages_total": len(msgs),
             "messages_24h": msg24,
             "tokens_24h": tok24,
             "tokens_total": tok_total,
             "hourly": hourly,
             "per_model": models,
+            "per_user": users_out,
             "last_response": {"ts": last[0], "model": last[1], "tps": last[2]} if last else None,
         }
 

@@ -358,8 +358,28 @@ function renderOwui(ow) {
       ow.per_model.map((x) => `<tr><td>${esc(x.model)}</td><td class="num">${fmt.n(x.messages)}</td><td class="num">${fmt.tokens(x.in_tokens)}</td>
         <td class="num">${fmt.tokens(x.out_tokens)}</td><td class="num">${fmt.n(x.avg_tps, 1)}</td><td class="num sm">${fmt.ago(x.last)}</td></tr>`).join("")
     : `<tr><td class="empty">Noch keine Antworten.</td></tr>`;
+  renderOwUsers(ow.per_user || []);
   const lr = ow.last_response;
   $("#ow-last").textContent = lr ? `Letzte Antwort ${fmt.ago(lr.ts)} von ${lr.model}${lr.tps ? ` mit ${fmt.n(lr.tps, 1)} tok/s` : ""}.` : "";
+}
+
+function renderOwUsers(users) {
+  if (!users.length) { $("#ow-users").innerHTML = `<tr><td class="empty">Keine Nutzer.</td></tr>`; return; }
+  const total = users.reduce((a, u) => a + u.tokens, 0) || 1;
+  $("#ow-users").innerHTML =
+    `<tr><th>Nutzer / Modell</th><th class="num" title="Antworten gesamt">Antw.</th><th class="num" title="Tokens Eingabe (Prompt + Kontext)">Tok. in</th><th class="num" title="Tokens Ausgabe">Tok. out</th><th class="num" title="Tokens in den letzten 24 h">24 h</th><th class="num">zuletzt</th></tr>` +
+    users.map((u) => {
+      const share = (u.tokens / total) * 100;
+      const head = `<tr class="u-row"><td><b>${esc(u.name)}</b> <span class="pill sm-pill">${esc(u.role)}</span>
+          <div class="u-sub"><span class="share" title="Anteil an allen Tokens"><i style="width:${share.toFixed(1)}%"></i></span>${fmt.n(share, 0)} % · ${fmt.n(u.chats)} Chats</div></td>
+        <td class="num">${fmt.n(u.messages)}${u.messages_24h ? `<div class="u-sub">${fmt.n(u.messages_24h)} in 24 h</div>` : ""}</td>
+        <td class="num">${fmt.tokens(u.in_tokens)}</td><td class="num">${fmt.tokens(u.out_tokens)}</td><td class="num">${fmt.tokens(u.tokens_24h)}</td>
+        <td class="num sm">${u.last_active ? fmt.ago(u.last_active) : "nie"}</td></tr>`;
+      const sub = (u.models || []).map((m) => `<tr class="u-model"><td class="sm">${esc(m.model)}${m.avg_tps ? ` <span class="muted">· ${fmt.n(m.avg_tps, 1)} tok/s</span>` : ""}</td>
+        <td class="num sm">${fmt.n(m.messages)}</td><td class="num sm">${fmt.tokens(m.in_tokens)}</td><td class="num sm">${fmt.tokens(m.out_tokens)}</td>
+        <td class="num sm">${fmt.tokens(m.tokens_24h)}</td><td class="num sm">${fmt.ago(m.last)}</td></tr>`).join("");
+      return head + (sub || `<tr class="u-model"><td class="sm muted" colspan="6">noch keine Antworten</td></tr>`);
+    }).join("");
 }
 
 function renderSystem(s) {
