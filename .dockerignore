@@ -1,0 +1,9 @@
+# keep secrets and local state out of the build context
+data/
+.env
+.env.*
+!.env.example
+.git/
+.impeccable/
+**/__pycache__/
+*.pyc

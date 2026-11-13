@@ -1,6 +1,7 @@
 "use strict";
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : "");   // numbers only, for markup
 const GiB = 1024 ** 3;
 
 const fmt = {
@@ -325,7 +326,7 @@ function renderOllama(ol) {
   $("#ol-recent").innerHTML = (rq.recent || []).length
     ? `<tr><th>Zeit</th><th>Client</th><th>Endpunkt</th><th class="num">Status</th><th class="num">Dauer</th></tr>` +
       rq.recent.map((r) => `<tr><td class="mono sm">${fmt.time(r.ts)}</td><td>${esc(r.client_name || r.client)}</td><td class="mono sm">${esc(r.method)} ${esc(r.path)}</td>
-        <td class="num mono ${r.status < 400 ? "code-ok" : "code-bad"}">${r.status}</td><td class="num">${fmt.secs(r.duration)}</td></tr>`).join("")
+        <td class="num mono ${r.status < 400 ? "code-ok" : "code-bad"}">${num(r.status)}</td><td class="num">${fmt.secs(r.duration)}</td></tr>`).join("")
     : `<tr><td class="empty">Keine Anfragen in den letzten 24 h.</td></tr>`;
 
   const loads = ol.loads || [];
@@ -417,7 +418,7 @@ function renderSystem(s) {
       `<dt>Drosselung</dt><dd>${thTxt}</dd>` + (th.available ? `<dt>gedrosselt (1 h)</dt><dd>${fmt.n(th.share_1h, 1)} %</dd>` : "")
     : `<dt>Fehler</dt><dd>${esc(gpu.error)}</dd>`;
   $("#gpu-procs").innerHTML = (gpu.processes || []).length
-    ? gpu.processes.map((p) => `<div class="item"><span class="name">${esc(p.name)} <span class="muted mono">${p.pid}</span></span><span class="meta">${p.gpu_mem_mib ? fmt.gib(p.gpu_mem_mib * 1048576) : p.rss ? fmt.gib(p.rss) : ""}</span></div>`).join("")
+    ? gpu.processes.map((p) => `<div class="item"><span class="name">${esc(p.name)} <span class="muted mono">${num(p.pid)}</span></span><span class="meta">${p.gpu_mem_mib ? fmt.gib(p.gpu_mem_mib * 1048576) : p.rss ? fmt.gib(p.rss) : ""}</span></div>`).join("")
     : `<div class="empty">Keine aktiven GPU-Prozesse.</div>`;
 
   const n = sys.net, io = sys.disk_io, mem = sys.memory;
@@ -488,7 +489,7 @@ function renderPsi(s) {
     `<div class="note" style="margin-top:0">Werte: 10 s · 60 s · 5 min. Balken bis 50 %.</div>`;
   const oom = (s.journal || {}).oom || {};
   $("#oom").innerHTML = (oom.recent || []).length
-    ? oom.recent.map((o) => `<div class="item"><span class="name">${esc(o.process)} <span class="muted mono">${o.pid}</span></span><span class="meta">${o.cgroup ? "cgroup · " : ""}${fmt.ago(o.ts)}</span></div>`).join("")
+    ? oom.recent.map((o) => `<div class="item"><span class="name">${esc(o.process)} <span class="muted mono">${num(o.pid)}</span></span><span class="meta">${o.cgroup ? "cgroup · " : ""}${fmt.ago(o.ts)}</span></div>`).join("")
     : `<div class="empty">Keine OOM-Kills${pr.oom_kills_boot != null ? ` (seit Boot: ${pr.oom_kills_boot})` : ""}.</div>`;
 }
 
@@ -599,11 +600,11 @@ function renderBrokers() {
     const pill = !x.enabled ? `<span class="pill">deaktiviert</span>` : st?.connected ? `<span class="pill ok">verbunden</span>` : `<span class="pill bad">getrennt</span>`;
     return `<div class="broker" data-id="${esc(x.id)}"><div class="b-head"><span class="b-name">${esc(x.name)}</span>${pill}</div>
       <dl class="dl">
-        <dt>Adresse</dt><dd>${esc(x.host)}:${x.port}${x.tls ? " (TLS)" : ""}</dd>
+        <dt>Adresse</dt><dd>${esc(x.host)}:${num(x.port)}${x.tls ? " (TLS)" : ""}</dd>
         <dt>Benutzer</dt><dd>${esc(x.username || "–")}</dd>
         <dt>Topic</dt><dd>${esc(x.base_topic)}/state</dd>
         <dt>Discovery</dt><dd>${x.discovery ? esc(x.discovery_prefix) : "aus"}</dd>
-        <dt>Intervall</dt><dd>${x.interval} s</dd>
+        <dt>Intervall</dt><dd>${num(x.interval)} s</dd>
         <dt>Zuletzt gesendet</dt><dd class="b-last">${st?.last_publish ? fmt.ago(st.last_publish) : "–"}</dd>
         <dt>Nachrichten</dt><dd class="b-sent">${fmt.n(st?.sent)}</dd>
       </dl>
@@ -628,7 +629,10 @@ function renderMqttStatus(st) {
 }
 
 const dlg = $("#dlg"), form = $("#broker-form");
-const adminPw = { get: () => { try { return sessionStorage.getItem("mm-admin") || ""; } catch { return ""; } }, set: (v) => { try { sessionStorage.setItem("mm-admin", v); } catch { /* ignore */ } } };
+// admin password only in memory for this page (not in sessionStorage, where any script could read it)
+let _adminPw = "";
+try { sessionStorage.removeItem("mm-admin"); } catch { /* ignore */ }
+const adminPw = { get: () => _adminPw, set: (v) => { _adminPw = v; } };
 
 function openDialog(b) {
   state.editing = b?.id || null;
@@ -638,7 +642,7 @@ function openDialog(b) {
   for (const el of form.elements) {
     if (!el.name || el.name === "admin") continue;
     if (el.type === "checkbox") el.checked = !!d[el.name];
-    else if (el.name === "password") { el.value = ""; el.placeholder = b?.has_password ? "unverändert" : "(leer)"; }
+    else if (el.name === "password") { el.value = ""; el.placeholder = b?.has_password ? "unverändert (nur bei gleichem Host/Port/Benutzer)" : "(leer)"; }
     else el.value = d[el.name] ?? "";
   }
   form.elements.admin.value = adminPw.get();
@@ -703,7 +707,7 @@ $("#btn-power").addEventListener("click", async () => {
   formP.reset();
   formP.elements.host.value = s.host || "";
   formP.elements.channel.value = s.channel ?? 0;
-  formP.elements.password.placeholder = s.has_password ? "unverändert" : "(kein Passwort)";
+  formP.elements.password.placeholder = s.has_password ? "unverändert (nur bei gleichem Host)" : "(kein Passwort)";
   formP.elements.price_eur_kwh.value = s.price_eur_kwh != null ? String(s.price_eur_kwh).replace(".", ",") : "";
   formP.elements.admin.value = adminPw.get();
   $("#power-msg").textContent = r.editable ? "" : "Bearbeiten deaktiviert: ADMIN_PASSWORD fehlt.";

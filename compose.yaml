@@ -8,18 +8,37 @@ services:
     restart: unless-stopped
     devices:
       - nvidia.com/gpu=all      # CDI: nvidia-smi inside the container
+    # hardening: no Linux capabilities except raw ICMP for ping, no privilege gain, read-only root fs
+    cap_drop: [ALL]
+    cap_add: [NET_RAW]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    mem_limit: 1g
+    pids_limit: 256
     environment:
       - TZ=Europe/Berlin
       - PORT=8088
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      - PUBLIC_URL=${PUBLIC_URL:-}   # optional, z. B. http://<host>:8088 (Link in Home Assistant)
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}             # mind. 12 Zeichen, sonst ist Bearbeiten deaktiviert
+      - PUBLIC_URL=${PUBLIC_URL:-}                   # optional, z. B. http://<host>:8088 (Link in Home Assistant)
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-}             # zusätzliche Hostnamen fürs Dashboard (IP-Adressen gehen immer)
+      - SSL_CERTFILE=${SSL_CERTFILE:-}               # optional: HTTPS direkt in uvicorn (Pfade unter /data)
+      - SSL_KEYFILE=${SSL_KEYFILE:-}
     volumes:
       - ./data:/data
-      - /:/host:ro                                   # disk usage, os-release, hostname
-      - /var/run/docker.sock:/var/run/docker.sock:ro # container status (read only API calls)
-      - /var/log/journal:/var/log/journal:ro         # ollama request log
+      # only the host paths that are actually read (no whole-root mount)
+      - /etc/os-release:/host/etc/os-release:ro
+      - /etc/hostname:/host/etc/hostname:ro
+      - /etc/apt:/host/etc/apt:ro                    # apt: pending updates (simulation only)
+      - /var/lib/apt:/host/var/lib/apt:ro
+      - /var/lib/dpkg:/host/var/lib/dpkg:ro          # also the probe for host "/" disk usage
+      - /usr/share/ollama/.ollama/models:/host/usr/share/ollama/.ollama/models:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro # container status (code only issues GET requests)
+      - /var/log/journal:/var/log/journal:ro         # ollama request log, errors, SSH, OOM
       - /etc/machine-id:/etc/machine-id:ro
       - /run:/hostrun:ro                             # reboot-required flag
+      - /var/lib/metis-monitor:/hostsmart:ro         # smart.json from the root cron job (root-only dir)
       - open-webui-data:/owui:ro                     # Open WebUI usage stats (read-only)
 
 volumes:

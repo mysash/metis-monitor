@@ -1,4 +1,7 @@
-fastapi==0.115.12
+# Direct dependencies (human-edited). The image installs requirements.lock (all transitive deps, hash-pinned).
+# Regenerate: pip-compile --generate-hashes --allow-unsafe --strip-extras -o requirements.lock requirements.txt
+fastapi==0.129.2
+starlette==0.52.1
 uvicorn[standard]==0.34.2
 httpx==0.28.1
 psutil==7.0.0

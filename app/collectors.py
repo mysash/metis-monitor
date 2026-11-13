@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -32,6 +34,30 @@ def _read(path: str, default: str = "") -> str:
         return default
 
 
+def _valid_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _num(v) -> float | None:
+    """Finite real number or None (rejects bool, str, NaN, ±inf)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)
+    except (OverflowError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _int(v, default: int = 0) -> int:
+    f = _num(v)
+    return int(f) if f is not None and abs(f) < 1e15 else default
+
+
 def _iso(ts: float | None) -> str | None:
     if not ts:
         return None
@@ -42,7 +68,9 @@ def _ts_norm(v) -> float:
     """Normalise s / ms / µs / ns epoch values to seconds."""
     try:
         v = float(v or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(v) or v < 0:
         return 0.0
     if v > 1e17:
         return v / 1e9
@@ -125,6 +153,17 @@ class SystemCollector:
             "other": [{"name": k, "temp": v} for k, v in hw.items() if k != "nvme"],
         }
 
+    def _disk_probe(self, mnt: str) -> str:
+        """Path whose filesystem is the host's mount point. With narrow bind mounts the host root is not
+        mounted as a whole, so for "/" use a directory that is bind-mounted from the host root fs."""
+        p = os.path.join(self.root, mnt.lstrip("/"))
+        if mnt == "/" and not os.path.ismount(p):
+            for cand in ("var/lib/dpkg", "etc/apt"):
+                c = os.path.join(self.root, cand)
+                if os.path.ismount(c):
+                    return c
+        return p
+
     @staticmethod
     def _default_iface() -> str | None:
         for line in _read("/proc/net/route").splitlines()[1:]:
@@ -146,7 +185,7 @@ class SystemCollector:
         disks = []
         for mnt in self.disks:
             try:
-                u = psutil.disk_usage(os.path.join(self.root, mnt.lstrip("/")))
+                u = psutil.disk_usage(self._disk_probe(mnt))
                 disks.append({"mount": mnt, "total": u.total, "used": u.used, "free": u.free, "percent": u.percent})
             except OSError:
                 pass
@@ -289,11 +328,13 @@ class GpuCollector:
 # --------------------------------------------------------------------------- Ollama log
 INFER_PATHS = ("/api/chat", "/api/generate", "/api/embed", "/api/embeddings",
                "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses", "/v1/messages")
-GIN_RE = re.compile(r'\[GIN\][^|]*\|\s*(\d{3})\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(\w+)\s+"([^"]+)"')
-DUR_RE = re.compile(r"([\d.]+)(h|ms|µs|us|ns|m|s)")
+# fields are non-overlapping ([^|\s] start, no trailing-space ambiguity) → linear matching
+GIN_RE = re.compile(r'\[GIN\][^|]*\|\s*(\d{3})\s*\|\s*([^|\s][^|]*?)\s*\|\s*([^|\s][^|]*?)\s*\|\s*(\w+)\s+"([^"]{1,2048})"')
+DUR_RE = re.compile(r"(\d+(?:\.\d+)?)(h|ms|µs|us|ns|m|s)")
 DUR_MULT = {"h": 3600, "m": 60, "s": 1, "ms": 1e-3, "µs": 1e-6, "us": 1e-6, "ns": 1e-9}
 BLOB_RE = re.compile(r"sha256-([0-9a-f]{64})")
-RUNNER_RE = re.compile(r"llama runner started in ([\d.]+) seconds")
+RUNNER_RE = re.compile(r"llama runner started in (\d+(?:\.\d+)?) seconds")
+MAX_NAME_CACHE = 1024
 
 
 def parse_go_duration(s: str) -> float:
@@ -320,26 +361,42 @@ class OllamaLogTailer:
             name = ""
             if ip in ("127.0.0.1", "::1"):
                 name = "localhost"
-            else:
+            elif _valid_ip(ip):
                 try:
                     name = socket.gethostbyaddr(ip)[0]
                 except Exception:
                     name = ""
+            if len(self.names) >= MAX_NAME_CACHE:
+                self.names.clear()
             self.names[ip] = name
         return self.names[ip]
 
     def _run(self) -> None:
+        cursor = None   # resume exactly after the last processed record → no duplicates on restart
         while True:
+            proc = None
             try:
+                start = [f"--after-cursor={cursor}"] if cursor else ["--since=-7d"]
                 proc = subprocess.Popen(
                     ["journalctl", "-u", self.unit, "-o", "json", "--output-fields=MESSAGE",
-                     "--since=-7d", "-f", "--no-pager"],
+                     *start, "-f", "--no-pager"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
                 )
                 self.available = True
                 self.error = None
                 for line in proc.stdout:
-                    self._handle(line)
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    if isinstance(rec.get("__CURSOR"), str):
+                        cursor = rec["__CURSOR"]
+                    try:
+                        self._handle(rec)
+                    except Exception as e:  # noqa: BLE001 – one odd line must not stop the tailer
+                        log.debug("ollama log: Zeile übersprungen: %s", e)
                 err = proc.stderr.read().strip()
                 proc.wait()
                 self.error = err or f"journalctl beendet ({proc.returncode})"
@@ -349,15 +406,15 @@ class OllamaLogTailer:
                 return
             except Exception as e:  # noqa: BLE001
                 self.error = str(e)
+            finally:
+                if proc and proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
             log.warning("ollama log tailer: %s – restart in 15s", self.error)
             self.available = False
             time.sleep(15)
 
-    def _handle(self, line: str) -> None:
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            return
+    def _handle(self, rec: dict) -> None:
         msg = rec.get("MESSAGE")
         if isinstance(msg, list):  # binary messages come as byte arrays
             try:
@@ -380,7 +437,7 @@ class OllamaLogTailer:
         self.total_seen += 1
         if not path.startswith(INFER_PATHS):
             return
-        client = client.strip()
+        client = client.strip()[:64]
         ev = (ts, method, path, int(status), parse_go_duration(dur), client, self._resolve(client))
         with self.lock:
             self.events.append(ev)
@@ -557,16 +614,25 @@ class OpenWebUICollector:
                 pu["chats"] += 1
                 if _ts_norm(up) >= now - 86400:
                     pu["chats_24h"] += 1
+        def tok(u: dict, *keys: str) -> int:
+            for k in keys:
+                n = _int(u.get(k))
+                if n > 0:
+                    return min(n, 10**9)
+            return 0
+
         for model, usage, created, uid in msgs:
             ts = _ts_norm(created)
+            model = str(model)[:200] if model else None
             try:
                 u = json.loads(usage) if usage else {}
-            except ValueError:
+            except (ValueError, TypeError, RecursionError):
                 u = {}
-            u = u or {}
-            out_t = int(u.get("output_tokens") or u.get("eval_count") or u.get("completion_tokens") or 0)
-            in_t = int(u.get("input_tokens") or u.get("prompt_eval_count") or u.get("prompt_tokens") or 0)
-            tps = u.get("response_token/s")
+            if not isinstance(u, dict):     # one malformed row must not disable all statistics
+                u = {}
+            out_t = tok(u, "output_tokens", "eval_count", "completion_tokens")
+            in_t = tok(u, "input_tokens", "prompt_eval_count", "prompt_tokens")
+            tps = _num(u.get("response_token/s"))
             pm = per_model.setdefault(model or "?", {"model": model or "?", "messages": 0, "out_tokens": 0,
                                                      "in_tokens": 0, "_tps": [], "last": 0})
             pm["messages"] += 1
@@ -576,8 +642,8 @@ class OpenWebUICollector:
             if isinstance(tps, (int, float)) and tps > 0:
                 pm["_tps"].append(tps)
             tok_total += out_t + in_t
-            dur_ns = u.get("total_duration")
-            if ts >= now - 7 * 86400 and isinstance(dur_ns, (int, float)) and dur_ns > 0:
+            dur_ns = _num(u.get("total_duration"))
+            if ts >= now - 7 * 86400 and dur_ns is not None and dur_ns > 0:
                 recent.append((model or "?", ts, dur_ns / 1e9, out_t))   # created_at = start of the reply
             if ts >= now - 86400:
                 msg24 += 1
@@ -741,10 +807,16 @@ class ShellyCollector:
         base = f"http://{p['host']}"
         auth = httpx.DigestAuth("admin", p["password"]) if p.get("password") else None
         ch = int(p.get("channel") or 0)
+        def obj(v) -> dict:
+            return v if isinstance(v, dict) else {}
+
+        def txt(v) -> str | None:
+            return str(v)[:80] if isinstance(v, (str, int)) and not isinstance(v, bool) else None
+
         try:
             if self.info_host != p["host"]:
                 r = await self.http.get(f"{base}/shelly", timeout=5)
-                self.info = r.json()
+                self.info = obj(r.json())
                 self.info_host = p["host"]
             st = None
             for method in ("Switch.GetStatus", "PM1.GetStatus"):
@@ -752,28 +824,36 @@ class ShellyCollector:
                 if r.status_code == 401:
                     raise RuntimeError("Authentifizierung fehlgeschlagen (Passwort?)")
                 if r.status_code == 200:
-                    st = r.json()
+                    st = obj(r.json())
                     break
             if st is None:
                 raise RuntimeError(f"Keine Messdaten (HTTP {r.status_code})")
-            total_wh = (st.get("aenergy") or {}).get("total")
+            # untrusted device reply: only finite numbers get through (no strings, NaN, Infinity)
+            total_wh = _num(obj(st.get("aenergy")).get("total"))
+            if total_wh is not None and not (0 <= total_wh < 1e12):
+                total_wh = None
             energy = await to_thread(self.ledger.update, total_wh) if total_wh is not None else {}
             price = p.get("price_eur_kwh")
+            out = st.get("output")
             return {
                 "configured": True, "up": True, "host": p["host"],
-                "name": self.info.get("name") or self.info.get("id"), "model": self.info.get("model"),
-                "gen": self.info.get("gen"), "fw": self.info.get("ver"),
-                "output": st.get("output"), "power": st.get("apower"), "voltage": st.get("voltage"),
-                "current": st.get("current"), "freq": st.get("freq"),
-                "temp": (st.get("temperature") or {}).get("tC"),
+                "name": txt(self.info.get("name")) or txt(self.info.get("id")), "model": txt(self.info.get("model")),
+                "gen": _num(self.info.get("gen")), "fw": txt(self.info.get("ver")),
+                "output": out if isinstance(out, bool) else None,
+                "power": _num(st.get("apower")), "voltage": _num(st.get("voltage")),
+                "current": _num(st.get("current")), "freq": _num(st.get("freq")),
+                "temp": _num(obj(st.get("temperature")).get("tC")),
                 "meter_total_kwh": total_wh / 1000 if total_wh is not None else None,
                 "price_eur_kwh": price,
                 **energy,
             }
         except Exception as e:  # noqa: BLE001
             self.info_host = None
-            return {"configured": True, "up": False, "host": p["host"], "error": str(e),
-                    **(await to_thread(self.ledger.summary))}
+            try:
+                summary = await to_thread(self.ledger.summary)
+            except Exception:  # noqa: BLE001 – the error path itself must never raise
+                summary = {}
+            return {"configured": True, "up": False, "host": p["host"], "error": str(e)[:200], **summary}
 
 
 # --------------------------------------------------------------------------- Docker
@@ -873,7 +953,8 @@ def flatten(s: dict) -> dict:
     lr = ow.get("last_response") or {}
 
     def r(v, n=1):
-        return round(v, n) if isinstance(v, (int, float)) else None
+        f = _num(v)
+        return round(f, n) if f is not None else None
 
     return {
         "cpu_percent": r(sysd["cpu"]["percent"]),
@@ -898,8 +979,8 @@ def flatten(s: dict) -> dict:
         "gpu_clock_mhz": gpu.get("clock_mhz"),
         "ollama_up": bool(ol.get("up")),
         "ollama_loaded_count": len(loaded),
-        "ollama_loaded_model": ", ".join(m["name"] for m in loaded) if loaded else "keins",
-        "ollama_loaded_gib": r(sum((m.get("size_vram") or m.get("size") or 0) for m in loaded) / GiB, 2),
+        "ollama_loaded_model": ", ".join(str(m.get("name") or "?") for m in loaded)[:250] if loaded else "keins",
+        "ollama_loaded_gib": r(sum(_num(m.get("size_vram") or m.get("size")) or 0 for m in loaded) / GiB, 2),
         "ollama_installed_count": len(ol.get("installed") or []),
         "ollama_requests_1h": logs.get("requests_1h"),
         "ollama_requests_24h": logs.get("requests_24h"),

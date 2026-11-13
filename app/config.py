@@ -78,14 +78,33 @@ def _normalize_broker(b: dict) -> dict:
     return out
 
 
+def same_broker_target(a: dict | None, b: dict) -> bool:
+    """A stored password may only be reused for the destination it was entered for."""
+    if not a:
+        return False
+    return (str(a.get("host") or "").strip().lower() == str(b.get("host") or "").strip().lower()
+            and int(a.get("port") or 1883) == int(b.get("port") or 1883)
+            and str(a.get("username") or "") == str(b.get("username") or "")
+            and bool(a.get("tls")) == bool(b.get("tls")))
+
+
+def stored_broker_password(prev: dict | None, raw: dict) -> str:
+    return prev["password"] if same_broker_target(prev, raw) else ""
+
+
 def validate_broker(b: dict) -> str | None:
     if not b["host"]:
         return "Host fehlt"
+    if not re.fullmatch(r"[A-Za-z0-9.\-:\[\]_]+", b["host"]):
+        return "Host ungültig"
     if not (1 <= b["port"] <= 65535):
         return "Port ungültig"
     for k in ("base_topic", "discovery_prefix"):
-        if not b[k] or any(c in b[k] for c in "#+ "):
-            return f"{k} ungültig (keine Leerzeichen, # oder +)"
+        v = b[k]
+        if not v or any(c in v for c in "#+ ") or v.startswith("$") or any(ord(c) < 32 for c in v):
+            return f"{k} ungültig (keine Leerzeichen, Steuerzeichen, # oder +, nicht mit $ beginnend)"
+    if b["base_topic"] == b["discovery_prefix"] or b["base_topic"].startswith(b["discovery_prefix"] + "/"):
+        return "base_topic darf nicht im discovery_prefix liegen"
     return None
 
 
@@ -108,9 +127,14 @@ class Config:
     def _write(self, data: dict) -> None:
         os.makedirs(DATA_DIR, exist_ok=True)
         tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        # created 0600 from the start (no umask window), never follows a planted symlink
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
-        os.chmod(tmp, 0o600)
         os.replace(tmp, CONFIG_PATH)
 
     def __getitem__(self, key):
@@ -120,15 +144,18 @@ class Config:
         return self.data.get(key, default)
 
     def set_brokers(self, brokers: list[dict]) -> list[dict]:
-        """Replace broker list. A missing/None password keeps the stored one."""
+        """Replace broker list. A missing/None password keeps the stored one – but only while
+        host, port, username and TLS stay the same (no replay of a secret to a new destination)."""
         with _lock:
             old = {b["id"]: b for b in self.data["brokers"]}
             new = []
             for raw in brokers:
+                if not isinstance(raw, dict):
+                    raise ValueError("Broker-Eintrag ungültig")
                 raw = dict(raw)
-                prev = old.get(raw.get("id") or "")
+                prev = old.get(str(raw.get("id") or ""))
                 if raw.get("password") is None:
-                    raw["password"] = prev["password"] if prev else ""
+                    raw["password"] = stored_broker_password(prev, raw)
                 b = _normalize_broker(raw)
                 err = validate_broker(b)
                 if err:
@@ -142,7 +169,9 @@ class Config:
             return new
 
     def set_power(self, p: dict) -> dict:
-        """Update Shelly settings. password None keeps the stored one."""
+        """Update Shelly settings. password None keeps the stored one while the host is unchanged."""
+        if not isinstance(p, dict):
+            raise ValueError("Objekt erwartet")
         with _lock:
             cur = self.data["power"]
             host = str(p.get("host") or "").strip()
@@ -156,10 +185,11 @@ class Config:
                 price = float(str(price).replace(",", "."))
                 if not (0 <= price < 10):
                     raise ValueError("Strompreis ungültig")
+            keep = cur["password"] if host.lower() == str(cur.get("host") or "").lower() else ""
             new = {
                 "host": host,
                 "channel": max(0, int(p.get("channel") or 0)),
-                "password": cur["password"] if p.get("password") is None else str(p["password"]),
+                "password": keep if p.get("password") is None else str(p["password"]),
                 "price_eur_kwh": price,
             }
             self.data["power"] = new

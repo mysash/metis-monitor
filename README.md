@@ -43,12 +43,17 @@ landen in einer Liste: oben rechts im Dashboard und per MQTT als `binary_sensor.
 ### NVMe SMART (optional)
 
 SMART-Werte brauchen Root-Rechte auf `/dev/nvme0`. Statt dem Container `SYS_ADMIN` zu geben, schreibt ein Cronjob
-auf dem Host die Werte alle 30 Minuten in eine Datei:
+auf dem Host die Werte alle 30 Minuten in ein **nur für root beschreibbares** Verzeichnis. Nicht nach `data/`: das kann
+der Container beschreiben, ein dort angelegter Symlink könnte sonst den Root-Cronjob umlenken. Der Container liest die
+Datei read-only als `/hostsmart/smart.json`:
 
 ```bash
-echo '*/30 * * * * root /usr/sbin/smartctl -j -a /dev/nvme0 > /home/local/stacks/metis-monitor/data/smart.json.tmp; mv /home/local/stacks/metis-monitor/data/smart.json.tmp /home/local/stacks/metis-monitor/data/smart.json' | sudo tee /etc/cron.d/metis-smart
-sudo /usr/sbin/smartctl -j -a /dev/nvme0 | sudo tee ~/stacks/metis-monitor/data/smart.json >/dev/null   # sofort einmal
+sudo install -d -m 755 -o root -g root /var/lib/metis-monitor
+echo '*/30 * * * * root /usr/sbin/smartctl -j -a /dev/nvme0 > /var/lib/metis-monitor/smart.json.tmp && mv /var/lib/metis-monitor/smart.json.tmp /var/lib/metis-monitor/smart.json' | sudo tee /etc/cron.d/metis-smart
+sudo sh -c '/usr/sbin/smartctl -j -a /dev/nvme0 > /var/lib/metis-monitor/smart.json'   # sofort einmal
 ```
+
+Ein älterer Cronjob, der nach `data/smart.json` schreibt, wird durch den `tee`-Befehl oben ersetzt.
 
 ## MQTT
 
@@ -64,6 +69,31 @@ Pro Broker:
 - HA-Discovery unter `<discovery_prefix>/{sensor,binary_sensor}/metis/<key>/config` → Gerät **metis**
 
 Konfiguration liegt in `data/config.yaml` (Passwörter im Klartext, Datei ist `chmod 600`).
+Ein gespeichertes Broker- oder Shelly-Passwort wird nur wiederverwendet, solange Host, Port, Benutzer und TLS gleich
+bleiben. Bei einem neuen Ziel muss es neu eingegeben werden. Für Broker im LAN möglichst TLS aktivieren und dem
+MQTT-Benutzer per ACL nur `<präfix>/#` und `<discovery_prefix>/#` erlauben.
+
+## Sicherheit
+
+- **Admin-Passwort:** `ADMIN_PASSWORD` in `.env`, mindestens 12 Zeichen. Der Platzhalter und kurze Werte werden
+  abgelehnt (Bearbeiten bleibt dann deaktiviert). Fehlversuche werden pro IP gebremst.
+- **Lesen ist ohne Login möglich** (LAN-Dashboard). Port 8088 sollte nur aus vertrauenswürdigen Netzen erreichbar sein.
+- **Host- und Origin-Prüfung:** Anfragen mit fremdem `Host`-Header (DNS-Rebinding) sowie WebSockets und POSTs von fremden
+  Webseiten werden abgewiesen. IP-Adressen und der Rechnername (`metis`, `metis.local`, `metis.lan`, `metis.fritz.box`)
+  gehen immer, weitere Namen kommen kommagetrennt in `ALLOWED_HOSTS`.
+- **HTTPS:** Ohne TLS gehen Admin- und Gerätepasswörter im Klartext durchs LAN. Entweder Zertifikat und Schlüssel nach
+  `data/tls/` legen und `SSL_CERTFILE=/data/tls/cert.pem` und `SSL_KEYFILE=/data/tls/key.pem` in `.env` setzen, oder
+  `HOST=127.0.0.1` setzen und einen HTTPS-Reverse-Proxy davorschalten.
+- **Container:** keine Capabilities außer `NET_RAW` (Ping), `no-new-privileges`, read-only Root-FS, 1 GiB Speicherlimit,
+  nur die benötigten Host-Pfade read-only. `data/` gehört `root:<deine Gruppe>` mit Modus `2775`, damit der Container
+  ohne `DAC_OVERRIDE` schreiben kann. Einmalig einrichten:
+  `docker run --rm -v "$PWD/data:/d" --network none metis-monitor sh -c 'chown 0:1000 /d && chmod 2775 /d'`
+- **Docker-Socket:** Der Code ruft nur GET-Endpunkte auf, aber `:ro` am Socket schränkt die Docker-API **nicht** ein.
+  Wer das weiter begrenzen will, schaltet einen filternden Socket-Proxy davor.
+- **Abhängigkeiten:** `requirements.lock` enthält alle Pakete mit Hashes (`pip install --require-hashes`), das
+  Basis-Image ist per Digest gepinnt. Aktualisieren mit
+  `pip-compile --generate-hashes --allow-unsafe --strip-extras -o requirements.lock requirements.txt`.
+- **Tests:** `docker run --rm -v "$PWD/tests:/srv/tests:ro" -e DATA_DIR=/tmp/d metis-monitor python -m unittest tests.test_security_fixes`
 
 ## Betrieb
 
@@ -76,5 +106,5 @@ docker logs -f metis-monitor
 Deployment vom Windows-PC:
 
 ```bash
-tar czf - --exclude=data --exclude=.env . | ssh <user>@<metis-host> 'cd ~/stacks/metis-monitor && tar xzf - && docker compose up -d --build'
+tar czf - --exclude=data --exclude=.env --exclude=.git --exclude=.impeccable . | ssh <user>@<metis-host> 'cd ~/stacks/metis-monitor && tar xzf - && docker compose up -d --build'
 ```

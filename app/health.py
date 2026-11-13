@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import ipaddress
 import json
 import logging
 import os
@@ -24,6 +25,8 @@ import httpx
 log = logging.getLogger("health")
 
 DOCKER_SOCK = "/var/run/docker.sock"
+WYOMING_MAX_DATA = 1 << 20      # 1 MiB is plenty for a describe/info payload
+JOURNAL_MAX = 50_000            # newest records per 7-day journal query (bounded memory and runtime)
 
 
 def _read(path: str, default: str = "") -> str:
@@ -55,15 +58,40 @@ def _journal(args: list[str], timeout: int = 60):
 
 
 _dns: dict[str, str] = {}
+_dns_lock = threading.Lock()
+MAX_DNS_CACHE = 2048
+
+
+def valid_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def cached_name(ip: str) -> str:
+    """Non-blocking: name from the cache only (safe to call on the event loop)."""
+    with _dns_lock:
+        return _dns.get(ip, "")
 
 
 def resolve(ip: str) -> str:
-    if ip not in _dns:
+    """Reverse DNS with a bounded cache; only real IP literals are looked up."""
+    with _dns_lock:
+        if ip in _dns:
+            return _dns[ip]
+    name = ""
+    if valid_ip(ip):
         try:
-            _dns[ip] = socket.gethostbyaddr(ip)[0]
+            name = socket.gethostbyaddr(ip)[0][:253]
         except Exception:
-            _dns[ip] = ""
-    return _dns[ip]
+            name = ""
+    with _dns_lock:
+        if len(_dns) >= MAX_DNS_CACHE:
+            _dns.clear()
+        _dns[ip] = name
+    return name
 
 
 class Periodic:
@@ -112,10 +140,16 @@ class ServiceChecker:
                 writer.write(b'{"type": "describe"}\n')
                 await writer.drain()
                 hdr = json.loads(await asyncio.wait_for(reader.readline(), 5))
-                data = hdr.get("data") or {}
+                if not isinstance(hdr, dict):
+                    raise ValueError("ungültige Wyoming-Antwort")
+                data = hdr.get("data") if isinstance(hdr.get("data"), dict) else {}
                 dl = int(hdr.get("data_length") or 0)
+                if not (0 <= dl <= WYOMING_MAX_DATA):   # peer-chosen length: bounded before buffering
+                    raise ValueError(f"data_length {dl} außerhalb des Limits")
                 if dl:
-                    data.update(json.loads(await asyncio.wait_for(reader.readexactly(dl), 5)))
+                    extra = json.loads(await asyncio.wait_for(reader.readexactly(dl), 5))
+                    if isinstance(extra, dict):
+                        data.update(extra)
             finally:
                 writer.close()
                 try:
@@ -209,7 +243,8 @@ class JournalCollector:
 
         # SSH
         acc, fails = [], []
-        for r in _journal(["--since=-7d", "-t", "sshd", "-t", "sshd-session", "--output-fields=MESSAGE"]):
+        for r in _journal(["--since=-7d", "-t", "sshd", "-t", "sshd-session", "-n", str(JOURNAL_MAX),
+                           "--output-fields=MESSAGE"]):
             m = r["MESSAGE"]
             if (a := SSH_ACCEPT.search(m)):
                 acc.append({"ts": r["_ts"], "method": a.group(1), "user": a.group(2), "ip": a.group(3)})
@@ -227,7 +262,7 @@ class JournalCollector:
 
         # OOM kills (kernel)
         ooms = []
-        for r in _journal(["--since=-7d", "_TRANSPORT=kernel", "--output-fields=MESSAGE"]):
+        for r in _journal(["--since=-7d", "_TRANSPORT=kernel", "-n", str(JOURNAL_MAX), "--output-fields=MESSAGE"]):
             if "Killed process" in r["MESSAGE"] and (o := OOM_RE.search(r["MESSAGE"])):
                 ooms.append({"ts": r["_ts"], "pid": int(o.group(1)), "process": o.group(2),
                              "cgroup": "memory cgroup" in r["MESSAGE"].lower()})
@@ -347,6 +382,9 @@ class VoiceUsage:
             if int(now) % 60 == 0:
                 with self.lock:
                     self.seen = {k: v for k, v in self.seen.items() if v > now}
+                    top = {ip for ev in self.events.values() for ip, _c in Counter(e[2] for e in ev).most_common(5)}
+                for ip in top:            # reverse DNS here, never on the asyncio loop
+                    resolve(ip)
             time.sleep(1)
 
     def stats(self) -> dict:
@@ -371,7 +409,7 @@ class VoiceUsage:
                     "requests_1h": sum(1 for e in evs if e[0] >= now - 3600), "requests_24h": len(d24),
                     "requests_7d": len(evs), "avg_duration_24h": round(sum(durs) / len(durs), 1) if durs else None,
                     "last_use": evs[-1][0] if evs else None, "hourly": hourly,
-                    "clients": [{"ip": ip, "name": resolve(ip), "count": c} for ip, c in Counter(e[2] for e in evs).most_common(5)],
+                    "clients": [{"ip": ip, "name": cached_name(ip), "count": c} for ip, c in Counter(e[2] for e in evs).most_common(5)],
                 }
         return {"available": self.error is None, "error": self.error, "services": out}
 
@@ -389,6 +427,9 @@ class OpenWebUIClients:
              "/ollama/v1/chat/completions", "/ollama/v1/completions", "/api/completions")
     EMBED = ("/api/embeddings", "/api/v1/embeddings", "/ollama/api/embed", "/ollama/api/embeddings",
              "/ollama/v1/embeddings")
+    MAX_CLIENTS = 25                # rows in snapshot/MQTT (top by activity)
+    MAX_WEB_IPS = 4096
+    LOG_MAX_BYTES = 32 << 20         # per fetch; the rest is picked up next cycle
     WEB = ("/_app/", "/static/", "/ws/socket.io", "/api/v1/chats", "/api/v1/auths/")   # only browsers do this
 
     def __init__(self, cfg, ollama_log) -> None:
@@ -414,25 +455,35 @@ class OpenWebUIClients:
 
     def _fetch(self) -> None:
         now = time.time()
-        r = self.http.get(f"/containers/{self.container}/logs",
-                          params={"stdout": 1, "stderr": 1, "timestamps": 1, "since": int(self.since)}, timeout=30)
-        if r.status_code != 200:
-            raise RuntimeError(f"Docker-Logs {self.container}: HTTP {r.status_code}")
+        buf = bytearray()
+        with self.http.stream("GET", f"/containers/{self.container}/logs",
+                              params={"stdout": 1, "stderr": 1, "timestamps": 1, "since": int(self.since)},
+                              timeout=30) as r:
+            if r.status_code != 200:
+                raise RuntimeError(f"Docker-Logs {self.container}: HTTP {r.status_code}")
+            for b in r.iter_bytes():
+                buf += b
+                if len(buf) >= self.LOG_MAX_BYTES:   # bounded memory; continue from `since` next cycle
+                    break
         last = self.since
         seen = {(e[0], e[1], e[4]) for e in self.events if e[0] >= self.since - 2}
-        for chunk in self._frames(r.content):
+        for chunk in self._frames(bytes(buf)):
             for line in chunk.splitlines():
                 ts_s, _, msg = line.partition(" ")
-                m = self.ACCESS_RE.search(msg)
-                if not m:
-                    continue
                 try:
                     ts = datetime.fromisoformat(ts_s[:26].rstrip("Z") + "+00:00").timestamp()
                 except ValueError:
                     continue
+                last = max(last, ts)                # advance on every line, not only matches
+                m = self.ACCESS_RE.search(msg)
+                if not m:
+                    continue
                 ip, method, path, status = m.group(1).strip("[]"), m.group(2), m.group(3).split("?", 1)[0], int(m.group(4))
-                last = max(last, ts)
+                if not valid_ip(ip):                # only real addresses become client keys
+                    continue
                 if path.startswith(self.WEB):
+                    if ip not in self.web_ips and len(self.web_ips) >= self.MAX_WEB_IPS:
+                        self.web_ips.pop(min(self.web_ips, key=self.web_ips.get))
                     self.web_ips[ip] = max(self.web_ips.get(ip, 0), ts)
                 if method != "POST":
                     continue
@@ -442,6 +493,8 @@ class OpenWebUIClients:
         self.since = max(self.since, last - 1)
         while self.events and self.events[0][0] < now - 7 * 86400:
             self.events.popleft()
+        cutoff = now - 7 * 86400
+        self.web_ips = {k: v for k, v in self.web_ips.items() if v >= cutoff}
 
     def _match_durations(self) -> None:
         """Pair Open WebUI requests with Ollama GIN events from localhost (start or end within 2 s)."""
@@ -496,17 +549,19 @@ class OpenWebUIClients:
             d = c.pop("_d")
             c["avg_s"] = round(sum(d) / len(d), 2) if d else None
             c["busy_s_24h"] = round(sum(d), 1) if d else 0
-            c["name"] = resolve(c["ip"])
             c["web"] = c["ip"] in self.web_ips
             clients.append(c)
         clients.sort(key=lambda x: (x["requests_24h"], x["last"]), reverse=True)
+        for c in clients[:self.MAX_CLIENTS]:     # reverse DNS only for the rows we actually show
+            c["name"] = resolve(c["ip"])
         for ts, ip, kind, _s, _p in self.events:
             if kind == "chat" and ip not in self.web_ips and ts >= now - 86400:
                 idx = 23 - int((now - ts) // 3600)
                 if 0 <= idx < 24:
                     hourly_api[idx] += 1
         api = [c for c in clients if not c["web"]]
-        return {"available": True, "clients": clients, "hourly_api": hourly_api,
+        return {"available": True, "clients": clients[:self.MAX_CLIENTS], "clients_total": len(clients),
+                "hourly_api": hourly_api,
                 "api_requests_24h": sum(c["requests_24h"] for c in api),
                 "api_requests_1h": sum(c["requests_1h"] for c in api),
                 "requests_24h": sum(c["requests_24h"] for c in clients)}
@@ -515,10 +570,14 @@ class OpenWebUIClients:
 class NvmeCollector:
     """Identity from sysfs (unprivileged); SMART health from a smartctl JSON file written on the host."""
 
+    HOST_FILE = "/hostsmart/smart.json"   # written by root on the host into a root-only dir (read-only mount)
+
     def __init__(self, cfg) -> None:
-        self.file = cfg["smart_file"]
+        self.cfg_file = cfg["smart_file"]
+        self.file = self.cfg_file
 
     def collect(self) -> dict:
+        self.file = self.HOST_FILE if os.path.exists(self.HOST_FILE) else self.cfg_file
         ctrls = []
         base = "/sys/class/nvme"
         try:
@@ -533,6 +592,8 @@ class NvmeCollector:
             st = os.stat(self.file)
             with open(self.file, encoding="utf-8") as f:
                 j = json.load(f)
+            if not isinstance(j, dict):
+                raise ValueError("smart.json: Objekt erwartet")
         except FileNotFoundError:
             out["smart_error"] = "missing"
             return out
@@ -540,6 +601,10 @@ class NvmeCollector:
             out["smart_error"] = str(e)
             return out
         h = j.get("nvme_smart_health_information_log") or {}
+        if not isinstance(h, dict):
+            h = {}
+        # numeric fields only (the file comes from outside the container; strings would break the snapshot)
+        h = {k: v for k, v in h.items() if isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) < 1e18}
         if not h:
             msgs = [m.get("string") for m in (j.get("smartctl") or {}).get("messages") or []]
             out["smart_error"] = "; ".join(m for m in msgs if m) or "keine SMART-Daten in der Datei"

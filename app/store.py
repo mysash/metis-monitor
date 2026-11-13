@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import sqlite3
 import threading
@@ -9,6 +11,22 @@ import time
 from datetime import date, timedelta
 
 from .sensors import HISTORY_KEYS
+
+log = logging.getLogger("store")
+
+
+def finite(v) -> float | None:
+    """Return v as float if it is a real, finite number (bools/strings/NaN/inf → None)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)
+    except (OverflowError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+MAX_METER_WH = 1e12   # plausibility bound for a cumulative meter reading
 
 
 class EnergyLedger:
@@ -24,6 +42,9 @@ class EnergyLedger:
         self._cache: dict[str, list[float]] = {}
 
     def update(self, total_wh: float) -> dict:
+        total_wh = finite(total_wh)
+        if total_wh is None or not (0 <= total_wh < MAX_METER_WH):
+            raise ValueError("Zählerstand ungültig")
         today = date.today().isoformat()
         now = time.time()
         with self.lock:
@@ -32,14 +53,17 @@ class EnergyLedger:
                 for d, (s, l) in self._cache.items():   # flush the finished day
                     self.con.execute("update energy_daily set start_wh=?, last_wh=? where day=?", (s, l, d))
                 r = self.con.execute("select start_wh, last_wh from energy_daily where day=?", (today,)).fetchone()
-                if r:
-                    row = [r[0], r[1]]
+                if r and finite(r[0]) is not None and finite(r[1]) is not None:
+                    row = [float(r[0]), float(r[1])]
                 else:
                     y = self.con.execute("select last_wh from energy_daily where day=?",
                                          ((date.today() - timedelta(days=1)).isoformat(),)).fetchone()
-                    start = y[0] if y and y[0] is not None and y[0] <= total_wh else total_wh
+                    yl = finite(y[0]) if y else None
+                    start = yl if yl is not None and yl <= total_wh else total_wh
                     row = [start, total_wh]
-                    self.con.execute("insert into energy_daily values (?,?,?)", (today, start, total_wh))
+                    if r:   # repair a corrupt row for today instead of failing forever
+                        log.warning("energy_daily %s: ungültige Werte ersetzt", today)
+                    self.con.execute("insert or replace into energy_daily values (?,?,?)", (today, start, total_wh))
                     self.con.commit()
                 self._cache = {today: row}
             if total_wh < row[1] - 1:          # meter reset: keep today's consumption
@@ -60,7 +84,10 @@ class EnergyLedger:
         for d, s, l in rows:
             if d in cache:
                 s, l = cache[d]
-            per_day[d] = max(0.0, (l or 0) - (s or 0)) / 1000
+            s, l = finite(s), finite(l)
+            if s is None or l is None:
+                continue          # skip corrupt rows instead of breaking every summary
+            per_day[d] = max(0.0, l - s) / 1000
         if not per_day:
             return {}
         since = min(per_day)
@@ -104,16 +131,17 @@ class History:
 
     def add(self, flat: dict) -> None:
         for k in HISTORY_KEYS:
-            v = flat.get(k)
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                self._acc.setdefault(k, []).append(float(v))
+            v = finite(flat.get(k))
+            if v is not None:
+                self._acc.setdefault(k, []).append(v)
         now = time.time()
         if now - self._acc_start < self.interval:
             return
         row = {k: round(sum(v) / len(v), 2) for k, v in self._acc.items() if v}
         self._acc, self._acc_start = {}, now
         with self.lock:
-            self.con.execute("insert or replace into samples(ts, data) values (?, ?)", (int(now), json.dumps(row)))
+            self.con.execute("insert or replace into samples(ts, data) values (?, ?)",
+                             (int(now), json.dumps(row, allow_nan=False)))
             if now - self._last_prune > 3600:
                 self.con.execute("delete from samples where ts < ?", (int(now - self.days * 86400),))
                 self._last_prune = now
@@ -123,10 +151,11 @@ class History:
         with self.lock:
             rows = self.con.execute("select ts, json_extract(data, ?) from samples where ts >= ? order by ts",
                                     (f"$.{key}", int(since))).fetchall()
-        return [(t, v) for t, v in rows if v is not None]
+        return [(t, f) for t, v in rows if (f := finite(v)) is not None]
 
     def query(self, seconds: int, keys: list[str], points: int = 360) -> dict:
-        keys = [k for k in keys if k in HISTORY_KEYS] or HISTORY_KEYS
+        # allowlisted + de-duplicated: at most len(HISTORY_KEYS) aggregate columns per query
+        keys = list(dict.fromkeys(k for k in keys if k in HISTORY_KEYS)) or HISTORY_KEYS
         bucket = max(self.interval, seconds // points)
         cols = ", ".join(f"avg(json_extract(data, '$.{k}'))" for k in keys)
         since = int(time.time() - seconds)

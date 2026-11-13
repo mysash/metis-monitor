@@ -11,6 +11,21 @@ import paho.mqtt.client as mqtt
 
 from .sensors import SENSORS
 
+
+def _clean(o):
+    if isinstance(o, float):
+        return o if o == o and o not in (float("inf"), float("-inf")) else None
+    if isinstance(o, dict):
+        return {k: _clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_clean(v) for v in o]
+    return o
+
+
+def jdump(o) -> str:
+    """Strict JSON for Home Assistant: NaN/Infinity become null."""
+    return json.dumps(_clean(o), allow_nan=False, default=str)
+
 log = logging.getLogger("mqtt")
 VERSION = "1.1.0"
 
@@ -122,7 +137,7 @@ class BrokerPublisher:
                     p[dst] = s[src]
             if s.get("attributes"):
                 p["json_attributes_topic"] = f"{self.base}/{s['attributes']}"
-            self.client.publish(f"{prefix}/{comp}/{node}/{key}/config", json.dumps(p), qos=1, retain=True)
+            self.client.publish(f"{prefix}/{comp}/{node}/{key}/config", jdump(p), qos=1, retain=True)
 
     # -- state
     def maybe_publish(self, flat: dict, snapshot: dict, force: bool = False) -> None:
@@ -133,19 +148,19 @@ class BrokerPublisher:
             return
         self._last_state = now
         try:
-            self.client.publish(f"{self.base}/state", json.dumps(flat), qos=0, retain=True)
+            self.client.publish(f"{self.base}/state", jdump(flat), qos=0, retain=True)
             ol = snapshot.get("ollama", {})
-            self.client.publish(f"{self.base}/ollama", json.dumps({
+            self.client.publish(f"{self.base}/ollama", jdump({
                 "loaded": [{k: m.get(k) for k in ("name", "size_vram", "expires_at", "context_length")}
                            for m in ol.get("loaded", [])],
                 "installed": [m.get("name") for m in ol.get("installed", [])],
                 "version": ol.get("version"),
             }), qos=0, retain=True)
             probs = snapshot.get("problems") or []
-            self.client.publish(f"{self.base}/problems", json.dumps({"problems": probs, "count": len(probs)}),
+            self.client.publish(f"{self.base}/problems", jdump({"problems": probs, "count": len(probs)}),
                                 qos=0, retain=True)
             ow = snapshot.get("openwebui", {})
-            self.client.publish(f"{self.base}/openwebui_users", json.dumps({"users": [
+            self.client.publish(f"{self.base}/openwebui_users", jdump({"users": [
                 {k: u.get(k) for k in ("name", "role", "chats", "messages", "messages_24h", "tokens", "tokens_24h",
                                        "tokens_7d", "in_tokens", "out_tokens")}
                 | {"last_active": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(u["last_active"]))
@@ -153,7 +168,7 @@ class BrokerPublisher:
                    "models": {m["model"]: m["in_tokens"] + m["out_tokens"] for m in u.get("models", [])}}
                 for u in ow.get("per_user") or []]}), qos=0, retain=True)
             oc = snapshot.get("owui_clients") or {}
-            self.client.publish(f"{self.base}/openwebui_clients", json.dumps({"clients": [
+            self.client.publish(f"{self.base}/openwebui_clients", jdump({"clients": [
                 {k: c.get(k) for k in ("ip", "name", "web", "requests_1h", "requests_24h", "requests_7d", "avg_s",
                                        "busy_s_24h", "errors_24h")} for c in oc.get("clients") or []]}),
                 qos=0, retain=True)
