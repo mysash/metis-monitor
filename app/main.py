@@ -431,9 +431,22 @@ SECURITY_HEADERS = {
 }
 
 
+_rejected_logged: dict[str, float] = {}
+
+
+def _log_rejected_host(host: str | None, ip: str) -> None:
+    """Log each rejected Host at most every 10 min, so the operator knows what to add to ALLOWED_HOSTS."""
+    key = (host or "")[:100]
+    now = time.time()
+    if now - _rejected_logged.get(key, 0) > 600 and len(_rejected_logged) < 1000:
+        _rejected_logged[key] = now
+        log.warning("Host %r abgewiesen (Client %s) – falls legitim, in ALLOWED_HOSTS eintragen", key, ip)
+
+
 @app.middleware("http")
 async def guard(request: Request, call_next):
     if not _host_ok(request.headers.get("host")):          # DNS rebinding
+        _log_rejected_host(request.headers.get("host"), _client_ip(request))
         return JSONResponse({"detail": "Host nicht erlaubt (ALLOWED_HOSTS)"}, status_code=421)
     if request.method not in ("GET", "HEAD", "OPTIONS") and not _origin_ok(request.headers.get("origin"),
                                                                        request.headers.get("host")):
