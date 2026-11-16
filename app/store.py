@@ -27,6 +27,7 @@ def finite(v) -> float | None:
 
 
 MAX_METER_WH = 1e12   # plausibility bound for a cumulative meter reading
+MAX_POWER_W = 10_000  # plausibility bound for consumption between two readings (meter steps)
 
 
 class EnergyLedger:
@@ -39,7 +40,13 @@ class EnergyLedger:
         self.con.execute("create table if not exists energy_daily (day text primary key, start_wh real, last_wh real)")
         self.con.commit()
         self._last_write = 0.0
+        self._last_ts: float | None = None
         self._cache: dict[str, list[float]] = {}
+
+    def _max_step(self, now: float) -> float:
+        """Largest plausible increase since the last accepted reading (Wh)."""
+        elapsed = now - self._last_ts if self._last_ts else 86400
+        return max(50.0, MAX_POWER_W * max(0.0, elapsed) / 3600)
 
     def update(self, total_wh: float) -> dict:
         total_wh = finite(total_wh)
@@ -59,16 +66,23 @@ class EnergyLedger:
                     y = self.con.execute("select last_wh from energy_daily where day=?",
                                          ((date.today() - timedelta(days=1)).isoformat(),)).fetchone()
                     yl = finite(y[0]) if y else None
-                    start = yl if yl is not None and yl <= total_wh else total_wh
+                    ok = yl is not None and 0 <= total_wh - yl <= self._max_step(now)
+                    start = yl if ok else total_wh
                     row = [start, total_wh]
                     if r:   # repair a corrupt row for today instead of failing forever
                         log.warning("energy_daily %s: ungültige Werte ersetzt", today)
                     self.con.execute("insert or replace into energy_daily values (?,?,?)", (today, start, total_wh))
                     self.con.commit()
                 self._cache = {today: row}
-            if total_wh < row[1] - 1:          # meter reset: keep today's consumption
+            step = total_wh - row[1]
+            if step < -1 or step > self._max_step(now):
+                # meter reset, swapped device or forged reading: re-base, keep today's consumption,
+                # never count the jump itself
+                if step > 0:
+                    log.warning("Shelly-Zähler springt um %.0f Wh – Sprung nicht gezählt", step)
                 row[0] = total_wh - (row[1] - row[0])
             row[1] = total_wh
+            self._last_ts = now
             if now - self._last_write > 60:
                 self.con.execute("update energy_daily set start_wh=?, last_wh=? where day=?", (row[0], row[1], today))
                 self.con.commit()
@@ -137,7 +151,11 @@ class History:
         now = time.time()
         if now - self._acc_start < self.interval:
             return
-        row = {k: round(sum(v) / len(v), 2) for k, v in self._acc.items() if v}
+        row = {}
+        for k, v in self._acc.items():
+            avg = finite(sum(x / len(v) for x in v)) if v else None   # divide first: no overflow
+            if avg is not None:
+                row[k] = round(avg, 2)
         self._acc, self._acc_start = {}, now
         with self.lock:
             self.con.execute("insert or replace into samples(ts, data) values (?, ?)",

@@ -55,6 +55,20 @@ sudo sh -c '/usr/sbin/smartctl -j -a /dev/nvme0 > /var/lib/metis-monitor/smart.j
 
 Ein älterer Cronjob, der nach `data/smart.json` schreibt, wird durch den `tee`-Befehl oben ersetzt.
 
+### Automatische Sicherheitsupdates (Host)
+
+Das Dashboard installiert selbst nichts, es zeigt nur an, was ansteht und ob ein Neustart nötig ist. Die Updates
+übernimmt `unattended-upgrades` direkt auf dem Host:
+
+```bash
+sudo sh ~/stacks/metis-monitor/host/setup-unattended-upgrades.sh
+```
+
+Das Skript installiert nur Ubuntu-Sicherheitsupdates (inkl. ESM). Kernel, NVIDIA-Treiber, CUDA, DKMS und
+Docker/containerd sowie alles aus dem NVIDIA-Spark-Repository und den NVIDIA-PPAs bleiben ausgenommen und werden
+bewusst per SSH aktualisiert. Es gibt keinen automatischen Neustart, geänderte Konfigurationsdateien bleiben erhalten.
+Log: `/var/log/unattended-upgrades/unattended-upgrades.log`.
+
 ## MQTT
 
 Broker werden im Web-UI (Abschnitt *MQTT*) angelegt; dafür ist das `ADMIN_PASSWORD` aus `.env` nötig.
@@ -77,6 +91,8 @@ MQTT-Benutzer per ACL nur `<präfix>/#` und `<discovery_prefix>/#` erlauben.
 
 - **Admin-Passwort:** `ADMIN_PASSWORD` in `.env`, mindestens 12 Zeichen. Der Platzhalter und kurze Werte werden
   abgelehnt (Bearbeiten bleibt dann deaktiviert). Fehlversuche werden pro IP gebremst.
+  Hinter einem Reverse-Proxy (z. B. NPM+) `FORWARDED_ALLOW_IPS=<IP des Proxys>` in `.env` setzen, sonst teilen sich
+  alle Nutzer die IP des Proxys und damit einen Fehlversuchs-Zähler.
 - **Lesen ist ohne Login möglich** (LAN-Dashboard). Port 8088 sollte nur aus vertrauenswürdigen Netzen erreichbar sein.
 - **Host- und Origin-Prüfung:** Anfragen mit fremdem `Host`-Header (DNS-Rebinding) sowie WebSockets und POSTs von fremden
   Webseiten werden abgewiesen. IP-Adressen und der Rechnername (`metis`, `metis.local`, `metis.lan`, `metis.fritz.box`)
@@ -93,7 +109,7 @@ MQTT-Benutzer per ACL nur `<präfix>/#` und `<discovery_prefix>/#` erlauben.
 - **Abhängigkeiten:** `requirements.lock` enthält alle Pakete mit Hashes (`pip install --require-hashes`), das
   Basis-Image ist per Digest gepinnt. Aktualisieren mit
   `pip-compile --generate-hashes --allow-unsafe --strip-extras -o requirements.lock requirements.txt`.
-- **Tests:** `docker run --rm -v "$PWD/tests:/srv/tests:ro" -e DATA_DIR=/tmp/d metis-monitor python -m unittest tests.test_security_fixes`
+- **Tests:** `docker run --rm -v "$PWD/tests:/srv/tests:ro" -e DATA_DIR=/tmp/d metis-monitor python -m unittest tests.test_security_fixes tests.test_run2_fixes`
 
 ## Betrieb
 

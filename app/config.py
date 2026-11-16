@@ -85,14 +85,27 @@ def same_broker_target(a: dict | None, b: dict) -> bool:
     return (str(a.get("host") or "").strip().lower() == str(b.get("host") or "").strip().lower()
             and int(a.get("port") or 1883) == int(b.get("port") or 1883)
             and str(a.get("username") or "") == str(b.get("username") or "")
-            and bool(a.get("tls")) == bool(b.get("tls")))
+            and bool(a.get("tls")) == bool(b.get("tls"))
+            and bool(a.get("tls_insecure")) == bool(b.get("tls_insecure")))
 
 
 def stored_broker_password(prev: dict | None, raw: dict) -> str:
     return prev["password"] if same_broker_target(prev, raw) else ""
 
 
+def utf8_ok(s: str) -> bool:
+    """Lone surrogates (e.g. from JSON "\\ud800") cannot be stored as YAML or sent over MQTT."""
+    try:
+        s.encode("utf-8")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def validate_broker(b: dict) -> str | None:
+    for k in ("host", "name", "username", "password", "base_topic", "discovery_prefix"):
+        if not utf8_ok(b[k]) or len(b[k]) > 512:
+            return f"{k} ungültig (Zeichen oder Länge)"
     if not b["host"]:
         return "Host fehlt"
     if not re.fullmatch(r"[A-Za-z0-9.\-:\[\]_]+", b["host"]):
@@ -188,10 +201,12 @@ class Config:
             keep = cur["password"] if host.lower() == str(cur.get("host") or "").lower() else ""
             new = {
                 "host": host,
-                "channel": max(0, int(p.get("channel") or 0)),
+                "channel": min(16, max(0, int(p.get("channel") or 0))),
                 "password": keep if p.get("password") is None else str(p["password"]),
                 "price_eur_kwh": price,
             }
+            if not utf8_ok(new["password"]) or len(new["password"]) > 512:
+                raise ValueError("Passwort ungültig")
             self.data["power"] = new
             self._write(self.data)
             return new

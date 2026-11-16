@@ -11,6 +11,7 @@ import platform
 import re
 import socket
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
@@ -51,6 +52,12 @@ def _num(v) -> float | None:
     except (OverflowError, ValueError):
         return None
     return f if math.isfinite(f) else None
+
+
+def _rng(v, lo: float, hi: float) -> float | None:
+    """Finite number within a plausible device range, else None (untrusted device replies)."""
+    f = _num(v)
+    return f if f is not None and lo <= f <= hi else None
 
 
 def _int(v, default: int = 0) -> int:
@@ -328,13 +335,46 @@ class GpuCollector:
 # --------------------------------------------------------------------------- Ollama log
 INFER_PATHS = ("/api/chat", "/api/generate", "/api/embed", "/api/embeddings",
                "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses", "/v1/messages")
-# fields are non-overlapping ([^|\s] start, no trailing-space ambiguity) → linear matching
-GIN_RE = re.compile(r'\[GIN\][^|]*\|\s*(\d{3})\s*\|\s*([^|\s][^|]*?)\s*\|\s*([^|\s][^|]*?)\s*\|\s*(\w+)\s+"([^"]{1,2048})"')
+# anchored at the line start; duration and client contain no spaces → no backtracking between fields
+GIN_RE = re.compile(r'\[GIN\] [^|]{0,64}\| *(\d{3}) *\| *([^| ]{1,32}) *\| *([^| ]{1,64}) *\| *(\w{1,10}) +"([^"]{1,2048})"')
+GIN_MAX_LEN = 2400
 DUR_RE = re.compile(r"(\d+(?:\.\d+)?)(h|ms|µs|us|ns|m|s)")
 DUR_MULT = {"h": 3600, "m": 60, "s": 1, "ms": 1e-3, "µs": 1e-6, "us": 1e-6, "ns": 1e-9}
 BLOB_RE = re.compile(r"sha256-([0-9a-f]{64})")
 RUNNER_RE = re.compile(r"llama runner started in (\d+(?:\.\d+)?) seconds")
 MAX_NAME_CACHE = 1024
+MAX_MODELS = 200              # rows from /api/tags and /api/ps (snapshot, websocket, retained MQTT)
+MAX_MANIFESTS = 2000
+MAX_MANIFEST_BYTES = 1 << 20
+
+
+def _valid_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _short(v, n: int = 128):
+    return v[:n] if isinstance(v, str) else None
+
+
+def _read_manifest(path: str):
+    """Regular files only (no FIFO/device/symlink), size-bounded."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_MANIFEST_BYTES:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            data = f.read(MAX_MANIFEST_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_MANIFEST_BYTES:
+        return None
+    return json.loads(data)
 
 
 def parse_go_duration(s: str) -> float:
@@ -429,7 +469,9 @@ class OllamaLogTailer:
             return
         if ts < time.time() - 86400:          # requests: only the last 24 h
             return
-        m = GIN_RE.search(msg)
+        if len(msg) > GIN_MAX_LEN:
+            return
+        m = GIN_RE.match(msg)
         if not m:
             return
         status, dur, client, method, path = m.groups()
@@ -437,8 +479,11 @@ class OllamaLogTailer:
         self.total_seen += 1
         if not path.startswith(INFER_PATHS):
             return
-        client = client.strip()[:64]
-        ev = (ts, method, path, int(status), parse_go_duration(dur), client, self._resolve(client))
+        # Gin reports X-Forwarded-For if present, so this is the client the request claims to be
+        client = client.strip().strip("[]")
+        if not _valid_ip(client):
+            client = "?"
+        ev = (ts, method, path, int(status), parse_go_duration(dur), client, self._resolve(client) if client != "?" else "")
         with self.lock:
             self.events.append(ev)
 
@@ -498,6 +543,11 @@ class OllamaLogTailer:
 
 
 # --------------------------------------------------------------------------- Ollama API
+def _models(js) -> list[dict]:
+    ms = js.get("models") if isinstance(js, dict) else None
+    return [m for m in ms if isinstance(m, dict)] if isinstance(ms, list) else []
+
+
 class OllamaCollector:
     def __init__(self, cfg, client: httpx.AsyncClient) -> None:
         self.url = cfg["ollama_url"].rstrip("/")
@@ -511,13 +561,18 @@ class OllamaCollector:
     def _scan_manifests(self) -> None:
         """Model blob sha256 -> model name (for load-time log lines)."""
         names = {}
+        count = 0
         for root, _dirs, files in os.walk(self.manifests):
             for fn in files:
+                count += 1
+                if count > MAX_MANIFESTS:
+                    break
                 path = os.path.join(root, fn)
                 try:
-                    with open(path, encoding="utf-8") as f:
-                        man = json.load(f)
+                    man = _read_manifest(path)
                 except Exception:
+                    continue
+                if not isinstance(man, dict):
                     continue
                 rel = os.path.relpath(path, self.manifests).replace(os.sep, "/")
                 parts = rel.split("/")
@@ -526,8 +581,8 @@ class OllamaCollector:
                 repo = "/".join(parts[1:-1])
                 repo = repo[len("library/"):] if repo.startswith("library/") else repo
                 name = f"{repo}:{parts[-1]}"
-                for layer in man.get("layers") or []:
-                    if layer.get("mediaType") == "application/vnd.ollama.image.model":
+                for layer in man.get("layers") if isinstance(man.get("layers"), list) else []:
+                    if isinstance(layer, dict) and layer.get("mediaType") == "application/vnd.ollama.image.model":
                         names[str(layer.get("digest", "")).replace("sha256:", "")] = name
         self.blob_names = names
 
@@ -536,13 +591,13 @@ class OllamaCollector:
             r = await self.http.get(f"{self.url}/api/ps", timeout=5)
             r.raise_for_status()
             loaded = []
-            for m in r.json().get("models", []):
-                det = m.get("details") or {}
+            for m in _models(r.json())[:MAX_MODELS]:
+                det = m.get("details") if isinstance(m.get("details"), dict) else {}
                 loaded.append({
-                    "name": m.get("name"), "size": m.get("size"), "size_vram": m.get("size_vram"),
-                    "expires_at": m.get("expires_at"), "context_length": m.get("context_length"),
-                    "parameter_size": det.get("parameter_size"), "quantization": det.get("quantization_level"),
-                    "family": det.get("family"),
+                    "name": _short(m.get("name")), "size": _num(m.get("size")), "size_vram": _num(m.get("size_vram")),
+                    "expires_at": _short(m.get("expires_at"), 40), "context_length": _num(m.get("context_length")),
+                    "parameter_size": _short(det.get("parameter_size"), 20),
+                    "quantization": _short(det.get("quantization_level"), 20), "family": _short(det.get("family"), 40),
                 })
             now = time.time()
             if now - self.tags_ts > 60 or self.version is None:
@@ -550,13 +605,16 @@ class OllamaCollector:
                 self.version = v.json().get("version")
                 t = await self.http.get(f"{self.url}/api/tags", timeout=10)
                 self.tags = []
-                for m in t.json().get("models", []):
-                    det = m.get("details") or {}
+                for m in _models(t.json())[:MAX_MODELS]:
+                    det = m.get("details") if isinstance(m.get("details"), dict) else {}
+                    caps = m.get("capabilities") if isinstance(m.get("capabilities"), list) else []
                     self.tags.append({
-                        "name": m.get("name"), "size": m.get("size"), "modified_at": m.get("modified_at"),
-                        "parameter_size": det.get("parameter_size"), "quantization": det.get("quantization_level"),
-                        "family": det.get("family"), "context_length": det.get("context_length"),
-                        "capabilities": m.get("capabilities") or [],
+                        "name": _short(m.get("name")), "size": _num(m.get("size")),
+                        "modified_at": _short(m.get("modified_at"), 40),
+                        "parameter_size": _short(det.get("parameter_size"), 20),
+                        "quantization": _short(det.get("quantization_level"), 20),
+                        "family": _short(det.get("family"), 40), "context_length": _num(det.get("context_length")),
+                        "capabilities": [c[:32] for c in caps[:16] if isinstance(c, str)],
                     })
                 self.tags.sort(key=lambda x: x.get("size") or 0, reverse=True)
                 self.tags_ts = now
@@ -840,9 +898,9 @@ class ShellyCollector:
                 "name": txt(self.info.get("name")) or txt(self.info.get("id")), "model": txt(self.info.get("model")),
                 "gen": _num(self.info.get("gen")), "fw": txt(self.info.get("ver")),
                 "output": out if isinstance(out, bool) else None,
-                "power": _num(st.get("apower")), "voltage": _num(st.get("voltage")),
-                "current": _num(st.get("current")), "freq": _num(st.get("freq")),
-                "temp": _num(obj(st.get("temperature")).get("tC")),
+                "power": _rng(st.get("apower"), -50_000, 50_000), "voltage": _rng(st.get("voltage"), 0, 1000),
+                "current": _rng(st.get("current"), -200, 200), "freq": _rng(st.get("freq"), 0, 100),
+                "temp": _rng(obj(st.get("temperature")).get("tC"), -60, 250),
                 "meter_total_kwh": total_wh / 1000 if total_wh is not None else None,
                 "price_eur_kwh": price,
                 **energy,

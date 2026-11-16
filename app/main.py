@@ -50,6 +50,7 @@ STATIC = os.path.join(os.path.dirname(__file__), "static")
 RANGES = {"1h": 3600, "6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400}
 MAX_WS_CLIENTS = 50
 WS_SEND_TIMEOUT = 3.0
+COLLECTOR_DEADLINE = 15.0
 
 
 def _allowed_hosts() -> set[str]:
@@ -154,18 +155,19 @@ class Monitor:
     def _ok(name: str, res, fallback: dict):
         """One failing collector must not abort the whole snapshot."""
         if isinstance(res, BaseException):
-            log.warning("collector %s: %s", name, res)
-            return {**fallback, "error": str(res)[:200]}
+            msg = "Zeitüberschreitung" if isinstance(res, asyncio.TimeoutError) else str(res)[:200]
+            log.warning("collector %s: %s", name, msg)
+            return {**fallback, "error": msg}
         return res
 
     async def collect(self) -> dict:
         system, gpu = await asyncio.gather(
             asyncio.to_thread(self.system.collect), asyncio.to_thread(self.gpu.collect)
         )
-        res = await asyncio.gather(
+        # total deadline per collector: a peer that drips bytes must not stall the whole loop
+        res = await asyncio.gather(*(asyncio.wait_for(c, COLLECTOR_DEADLINE) for c in (
             self.ollama.collect(), self.owui.collect(asyncio.to_thread), self.docker.collect(),
-            self.shelly.collect(asyncio.to_thread), self.services.collect(), return_exceptions=True,
-        )
+            self.shelly.collect(asyncio.to_thread), self.services.collect())), return_exceptions=True)
         ollama = self._ok("ollama", res[0], {"up": False, "loaded": []})
         owui = self._ok("openwebui", res[1], {"up": False})
         docker = self._ok("docker", res[2], {"available": False, "containers": []})
@@ -186,16 +188,20 @@ class Monitor:
                 "journal": self.journal.data, "voice": self.voice.stats(), "nvme": self.nvme.data,
                 "ping": self.ping.data, "energy_attr": self.energy_attr.data, "owui_clients": self.owui_clients.data}
         snap["metrics"] = {}
-        for name, fn in (("flatten", C.flatten), ("health-flatten", H.flatten)):
-            try:
-                snap["metrics"].update(fn(snap))
-            except Exception:  # noqa: BLE001 – keep the rest of the metrics
-                log.exception("%s failed", name)
+        try:
+            snap["metrics"].update(C.flatten(snap))
+        except Exception:  # noqa: BLE001 – keep the rest of the metrics
+            log.exception("flatten failed")
+        # problems needs the collector metrics (temperatures, disk); health-flatten needs the problems
         try:
             snap["problems"] = H.problems(snap)
         except Exception:  # noqa: BLE001
             log.exception("problems failed")
             snap["problems"] = []
+        try:
+            snap["metrics"].update(H.flatten(snap))
+        except Exception:  # noqa: BLE001
+            log.exception("health-flatten failed")
         return snap
 
     async def _refresh_apt(self) -> None:
@@ -212,7 +218,10 @@ class Monitor:
                 snap = await self.collect()
                 self.snapshot = snap
                 # off the event loop: the history lock may be held by a running /api/history query
-                await asyncio.to_thread(self.history.add, snap["metrics"])
+                try:
+                    await asyncio.to_thread(self.history.add, snap["metrics"])
+                except Exception:  # noqa: BLE001 – MQTT and the dashboard keep updating
+                    log.exception("history add failed")
                 await asyncio.to_thread(self.mqtt.publish, snap["metrics"], snap)
                 snap["mqtt"] = self.mqtt.status()
                 await self.broadcast(snap)
@@ -320,13 +329,30 @@ async def metrics():
     return mon.snapshot.get("metrics", {})
 
 
+_hist_sem = asyncio.Semaphore(2)
+_hist_cache: dict[tuple, tuple[float, dict]] = {}
+HIST_CACHE_S = 5.0
+
+
 @app.get("/api/history")
 async def history(range: str = "1h", keys: str = ""):
     seconds = RANGES.get(range)
     if not seconds:
         raise HTTPException(400, f"range muss einer von {list(RANGES)} sein")
     klist = list(dict.fromkeys(k for k in keys[:2000].split(",") if k in HISTORY_KEYS)) or HISTORY_KEYS
-    return await asyncio.to_thread(mon.history.query, seconds, klist)
+    key = (seconds, tuple(klist))
+    hit = _hist_cache.get(key)
+    if hit and time.monotonic() - hit[0] < HIST_CACHE_S:
+        return hit[1]
+    async with _hist_sem:                 # concurrent 7-day queries must not saturate the thread pool
+        hit = _hist_cache.get(key)
+        if hit and time.monotonic() - hit[0] < HIST_CACHE_S:
+            return hit[1]
+        res = await asyncio.to_thread(mon.history.query, seconds, klist)
+    if len(_hist_cache) > 64:
+        _hist_cache.clear()
+    _hist_cache[key] = (time.monotonic(), res)
+    return res
 
 
 @app.get("/api/sensors")

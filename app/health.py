@@ -37,6 +37,17 @@ def _read(path: str, default: str = "") -> str:
         return default
 
 
+def _jfield(v) -> str | None:
+    """journalctl -o json: a field is a string, a byte array (binary) or a list of values (repeated field)."""
+    if v is None or isinstance(v, str):
+        return v
+    if isinstance(v, list):
+        if v and all(isinstance(b, int) and 0 <= b < 256 for b in v):
+            return bytes(v).decode("utf-8", "replace")
+        return _jfield(v[0]) if v else None      # repeated field: first value
+    return str(v)
+
+
 def _journal(args: list[str], timeout: int = 60):
     """Run journalctl -o json and yield records with decoded MESSAGE and _ts (epoch seconds)."""
     out = subprocess.run(["journalctl", "--no-pager", "-q", "-o", "json", *args],
@@ -46,13 +57,11 @@ def _journal(args: list[str], timeout: int = 60):
             rec = json.loads(line)
         except ValueError:
             continue
-        msg = rec.get("MESSAGE")
-        if isinstance(msg, list):
-            try:
-                msg = bytes(msg).decode("utf-8", "replace")
-            except Exception:
-                msg = ""
-        rec["MESSAGE"] = msg or ""
+        if not isinstance(rec, dict):
+            continue
+        for k, v in list(rec.items()):
+            rec[k] = _jfield(v)
+        rec["MESSAGE"] = rec.get("MESSAGE") or ""
         rec["_ts"] = int(rec.get("__REALTIME_TIMESTAMP", 0) or 0) / 1e6
         yield rec
 
@@ -209,9 +218,11 @@ def read_pressure() -> dict:
 
 
 # --------------------------------------------------------------------------- journal
-SSH_ACCEPT = re.compile(r"Accepted (\S+) for (\S+) from (\S+) port")
-SSH_FAIL = re.compile(r"Failed (\S+) for (?:invalid user )?(\S*) from (\S+) port")
-SSH_INVALID = re.compile(r"Invalid user (\S*) from (\S+) port")
+SSH_ACCEPT = re.compile(r"Accepted (\S+) for (.{1,128}) from (\S+) port \d+(?: ssh2)?(?:: .*)?$")
+SSH_FAIL = re.compile(r"Failed (\S+) for (?:invalid user )?(.{0,128}) from (\S+) port \d+(?: ssh2)?(?:: .*)?$")
+SSH_INVALID = re.compile(r"Invalid user (.{0,128}) from (\S+) port \d+$")
+# selected by the trusted, journald-set unit field (not the self-declared SYSLOG_IDENTIFIER)
+SSH_UNITS = ("ssh.service", "sshd.service")
 OOM_RE = re.compile(r"Killed process (\d+) \(([^)]*)\)")
 MID_STARTED = "39f53479d3a045ac8e11786248231fbf"
 MID_JOB_FAILED = "be02cf6855d2428ba40df7e9d022f03d"
@@ -243,15 +254,15 @@ class JournalCollector:
 
         # SSH
         acc, fails = [], []
-        for r in _journal(["--since=-7d", "-t", "sshd", "-t", "sshd-session", "-n", str(JOURNAL_MAX),
+        for r in _journal(["--since=-7d", *(f"_SYSTEMD_UNIT={u}" for u in SSH_UNITS), "-n", str(JOURNAL_MAX),
                            "--output-fields=MESSAGE"]):
-            m = r["MESSAGE"]
-            if (a := SSH_ACCEPT.search(m)):
-                acc.append({"ts": r["_ts"], "method": a.group(1), "user": a.group(2), "ip": a.group(3)})
-            elif (f := SSH_FAIL.search(m)):
-                fails.append({"ts": r["_ts"], "user": f.group(2), "ip": f.group(3)})
-            elif (i := SSH_INVALID.search(m)):
-                fails.append({"ts": r["_ts"], "user": i.group(1), "ip": i.group(2)})
+            m = r["MESSAGE"][:512]
+            if (a := SSH_ACCEPT.match(m)) and valid_ip(a.group(3)):
+                acc.append({"ts": r["_ts"], "method": a.group(1)[:32], "user": a.group(2)[:64], "ip": a.group(3)})
+            elif (f := SSH_FAIL.match(m)) and valid_ip(f.group(3)):
+                fails.append({"ts": r["_ts"], "user": f.group(2)[:64], "ip": f.group(3)})
+            elif (i := SSH_INVALID.match(m)) and valid_ip(i.group(2)):
+                fails.append({"ts": r["_ts"], "user": i.group(1)[:64], "ip": i.group(2)})
         f24 = [f for f in fails if f["ts"] >= now - 86400]
         out["ssh"] = {
             "failed_24h": len(f24), "failed_7d": len(fails), "logins_7d": len(acc),
@@ -285,6 +296,8 @@ class JournalCollector:
 
 # --------------------------------------------------------------------------- voice usage (Wyoming)
 TCP_LISTEN, TCP_TIME_WAIT = "0A", "06"
+TCP_HALF_OPEN = {"02", "03", "0C"}     # SYN_SENT, SYN_RECV, NEW_SYN_RECV: no completed handshake
+MAX_VOICE_TRACKED = 20_000
 
 
 def _hex_ip(h: str) -> str:
@@ -335,7 +348,7 @@ class VoiceUsage:
         for fn in ("tcp", "tcp6"):
             for line in _read(f"/proc/{i['pid']}/net/{fn}").splitlines()[1:]:
                 p = line.split()
-                if len(p) < 4 or p[3] == TCP_LISTEN:
+                if len(p) < 4 or p[3] == TCP_LISTEN or p[3] in TCP_HALF_OPEN:
                     continue
                 lip, lport = p[1].rsplit(":", 1)
                 if int(lport, 16) != port:
@@ -354,6 +367,8 @@ class VoiceUsage:
                         self.open[key][1] = now
                         self.seen[key] = now + 180
                 elif key not in self.seen:
+                    if len(self.seen) >= MAX_VOICE_TRACKED or len(self.open) >= MAX_VOICE_TRACKED:
+                        continue                     # flood: stop tracking new peers until pruned
                     self.seen[key] = now + 180
                     if st == TCP_TIME_WAIT:          # whole connection happened between two polls
                         self.events[key[0]].append((now, 0.0, key[1]))
@@ -368,6 +383,7 @@ class VoiceUsage:
         self.events[key[0]].append((first, max(0.0, last - first), key[1]))
 
     def _run(self) -> None:
+        last_prune = 0.0
         while True:
             now = time.time()
             try:
@@ -379,7 +395,8 @@ class VoiceUsage:
                     log.warning("voice usage: %s", e)
                 self.error = str(e)
                 self.info.clear()
-            if int(now) % 60 == 0:
+            if now - last_prune >= 60:
+                last_prune = now
                 with self.lock:
                     self.seen = {k: v for k, v in self.seen.items() if v > now}
                     top = {ip for ev in self.events.values() for ip, _c in Counter(e[2] for e in ev).most_common(5)}
@@ -456,6 +473,7 @@ class OpenWebUIClients:
     def _fetch(self) -> None:
         now = time.time()
         buf = bytearray()
+        capped = False
         with self.http.stream("GET", f"/containers/{self.container}/logs",
                               params={"stdout": 1, "stderr": 1, "timestamps": 1, "since": int(self.since)},
                               timeout=30) as r:
@@ -464,6 +482,7 @@ class OpenWebUIClients:
             for b in r.iter_bytes():
                 buf += b
                 if len(buf) >= self.LOG_MAX_BYTES:   # bounded memory; continue from `since` next cycle
+                    capped = True
                     break
         last = self.since
         seen = {(e[0], e[1], e[4]) for e in self.events if e[0] >= self.since - 2}
@@ -490,7 +509,12 @@ class OpenWebUIClients:
                 kind = "chat" if path.startswith(self.INFER) else "embed" if path.startswith(self.EMBED) else None
                 if kind and (ts, ip, path) not in seen:
                     self.events.append((ts, ip, kind, status, path))
+        prev = self.since
         self.since = max(self.since, last - 1)
+        if capped and self.since <= prev + 1:
+            # more than LOG_MAX_BYTES within one second: skip ahead instead of re-reading it forever
+            self.since = prev + 2
+            log.warning("Open-WebUI-Log: über %d MiB in einer Sekunde – Rest übersprungen", self.LOG_MAX_BYTES >> 20)
         while self.events and self.events[0][0] < now - 7 * 86400:
             self.events.popleft()
         cutoff = now - 7 * 86400
@@ -503,6 +527,7 @@ class OpenWebUIClients:
                    if e[5] in ("127.0.0.1", "::1") and e[3] < 400]
         gin.sort()
         starts = [g[0] for g in gin]
+        now = time.time()
         used: set[int] = set()
         for ts, ip, kind, status, _p in self.events:
             if (ts, ip) in self.matched or status >= 400:
@@ -519,7 +544,9 @@ class OpenWebUIClients:
             if best is not None:
                 used.add(best)
                 self.matched[(ts, ip)] = gin[best][2]
-        cutoff = time.time() - 7 * 86400
+            elif ts < now - 600:
+                self.matched[(ts, ip)] = None     # no partner after 10 min: do not rescan every cycle
+        cutoff = now - 7 * 86400
         self.matched = {k: v for k, v in self.matched.items() if k[0] >= cutoff}
 
     def collect(self) -> dict:
@@ -695,16 +722,30 @@ class EnergyAttribution:
             prev = samples[k - 1][0] if k else t - iv
             spans.append((prev if t - prev <= 3 * iv else t - iv, t, v))
 
+        # prefix sums: excess(a, b) costs O(log n) regardless of the request duration
+        cum_wh, cum_cov = [0.0], [0.0]
+        for s0, s1, v in spans:
+            cum_wh.append(cum_wh[-1] + max(0.0, v - baseline) * (s1 - s0) / 3600)
+            cum_cov.append(cum_cov[-1] + (s1 - s0))
+
+        def part(k: int, a: float, b: float) -> tuple[float, float]:
+            s0, s1, v = spans[k]
+            ov = min(s1, b) - max(s0, a)
+            return (max(0.0, v - baseline) * ov / 3600, ov) if ov > 0 else (0.0, 0.0)
+
         def excess(a: float, b: float) -> tuple[float, float]:
-            i = bisect.bisect_left(ts, a)
-            wh = cov = 0.0
-            while i < len(spans) and spans[i][0] < b:
-                s0, s1, v = spans[i]
-                ov = min(s1, b) - max(s0, a)
-                if ov > 0:
-                    wh += max(0.0, v - baseline) * ov / 3600
-                    cov += ov
-                i += 1
+            i = bisect.bisect_right(ts, a)        # first span ending after a
+            if i >= len(spans) or b <= a:
+                return 0.0, 0.0
+            j = bisect.bisect_left(ts, b)         # first span ending at/after b
+            if j <= i:
+                return part(i, a, b)
+            wh, cov = part(i, a, b)               # spans i+1..j-1 lie fully inside (a, b)
+            wh += cum_wh[j] - cum_wh[i + 1]
+            cov += cum_cov[j] - cum_cov[i + 1]
+            if j < len(spans):
+                w2, c2 = part(j, a, b)
+                wh, cov = wh + w2, cov + c2
             return wh, cov
 
         per: dict[str, dict] = {}

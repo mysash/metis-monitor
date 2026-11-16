@@ -20,6 +20,8 @@ services:
     environment:
       - TZ=Europe/Berlin
       - PORT=8088
+      - HOST=${HOST:-0.0.0.0}                         # 127.0.0.1 = nur lokal (z. B. hinter HTTPS-Proxy auf demselben Host)
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}  # IP des Reverse-Proxys (NPM+), damit X-Forwarded-For gilt
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}             # mind. 12 Zeichen, sonst ist Bearbeiten deaktiviert
       - PUBLIC_URL=${PUBLIC_URL:-}                   # optional, z. B. http://<host>:8088 (Link in Home Assistant)
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:-}             # zusätzliche Hostnamen fürs Dashboard (IP-Adressen gehen immer)
