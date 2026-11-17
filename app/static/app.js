@@ -509,7 +509,7 @@ function renderNvme(s) {
   } else {
     st.textContent = "kein SMART"; st.className = "pill";
     $("#nvme-note").innerHTML = nv.smart_error === "missing"
-      ? `SMART-Werte (Verschleiß, geschriebene TB, Fehler) brauchen Root-Rechte. Ein Cronjob auf metis kann sie nach <span class="mono">data/smart.json</span> schreiben (siehe README).`
+      ? `SMART-Werte (Verschleiß, geschriebene TB, Fehler) brauchen Root-Rechte. Ein Root-Cronjob auf metis kann sie nach <span class="mono">/var/lib/metis-monitor/smart.json</span> schreiben (siehe README).`
       : `SMART: ${esc(nv.smart_error || "–")}`;
   }
   $("#nvme-info").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("");

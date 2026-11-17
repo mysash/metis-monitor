@@ -49,10 +49,11 @@ Datei read-only als `/hostsmart/smart.json`:
 
 ```bash
 sudo install -d -m 755 -o root -g root /var/lib/metis-monitor
-echo '*/30 * * * * root /usr/sbin/smartctl -j -a /dev/nvme0 > /var/lib/metis-monitor/smart.json.tmp && mv /var/lib/metis-monitor/smart.json.tmp /var/lib/metis-monitor/smart.json' | sudo tee /etc/cron.d/metis-smart
+echo '*/30 * * * * root /usr/sbin/smartctl -j -a /dev/nvme0 > /var/lib/metis-monitor/smart.json.tmp; [ -s /var/lib/metis-monitor/smart.json.tmp ] && mv /var/lib/metis-monitor/smart.json.tmp /var/lib/metis-monitor/smart.json' | sudo tee /etc/cron.d/metis-smart
 sudo sh -c '/usr/sbin/smartctl -j -a /dev/nvme0 > /var/lib/metis-monitor/smart.json'   # sofort einmal
 ```
 
+`smartctl` meldet Warnungen über den Exit-Code, deshalb wird die Datei verschoben, sobald sie nicht leer ist.
 Ein älterer Cronjob, der nach `data/smart.json` schreibt, wird durch den `tee`-Befehl oben ersetzt.
 
 ### Automatische Sicherheitsupdates (Host)
