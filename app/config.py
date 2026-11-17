@@ -104,7 +104,8 @@ def utf8_ok(s: str) -> bool:
 
 def validate_broker(b: dict) -> str | None:
     for k in ("host", "name", "username", "password", "base_topic", "discovery_prefix"):
-        if not utf8_ok(b[k]) or len(b[k]) > 512:
+        v = b.get(k) or ""
+        if not isinstance(v, str) or not utf8_ok(v) or len(v) > 512:
             return f"{k} ungültig (Zeichen oder Länge)"
     if not b["host"]:
         return "Host fehlt"

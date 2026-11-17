@@ -41,6 +41,7 @@ class LedgerTests(unittest.TestCase):
         led.summary()                      # must not raise
         s = led.update(1000.0)
         self.assertEqual(s["today_kwh"], 0.0)
+        led._last_ts -= 3600               # one hour later: 500 Wh is plausible
         s = led.update(1500.0)
         self.assertAlmostEqual(s["today_kwh"], 0.5)
 
